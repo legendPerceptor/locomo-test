@@ -35,7 +35,7 @@ except ImportError:
 
 
 # 默认模型：BAAI/bge-small-en-v1.5
-DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_MODEL = "BAAI/bge-large-zh-v1.5"
 DEFAULT_PORT = 8000
 
 # 模型缓存目录（放在项目目录下，方便管理）
@@ -126,6 +126,8 @@ def test_model(model: SentenceTransformer):
         ("猫", "狗"),
         ("苹果", "香蕉"),
         ("电脑", "沙发"),
+        ("Computer", "计算机"),
+        ("Elephant", "ivory")
     ]
 
     for t1, t2 in pairs:
@@ -179,15 +181,19 @@ def create_app(model: SentenceTransformer, model_name: str):
 
     @app.route("/v1/embeddings", methods=["POST"])
     def embeddings():
-        """批量获取文本的 embeddings"""
+        """批量获取文本的 embeddings（OpenAI兼容格式）"""
         data = request.get_json()
 
-        if not data or "texts" not in data:
-            return jsonify({"error": "请提供 'texts' 字段（数组）"}), 400
+        if not data:
+            return jsonify({"error": "请提供请求体"}), 400
 
-        texts = data["texts"]
-        if not isinstance(texts, list):
-            return jsonify({"error": "'texts' 必须是数组"}), 400
+        # 支持 OpenAI 格式 (input) 和自定义格式 (texts)
+        texts = data.get("input") or data.get("texts")
+        if isinstance(texts, str):
+            texts = [texts]
+
+        if not texts or not isinstance(texts, list):
+            return jsonify({"error": "请提供 'input' 或 'texts' 字段（字符串或数组）"}), 400
 
         try:
             embeddings = get_embeddings_batch(model, texts)
@@ -210,13 +216,6 @@ def create_app(model: SentenceTransformer, model_name: str):
                     "total_tokens": total_tokens
                 }
             })
-
-            # return jsonify({
-            #     "embeddings": embeddings,
-            #     "count": len(embeddings),
-            #     "dimension": len(embeddings[0]) if embeddings else 0,
-            #     "model": model_name,
-            # })
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -286,7 +285,7 @@ def main():
     print("   按 Ctrl+C 停止\n")
 
     app = create_app(model, args.model)
-    app.run(host="0.0.0.0", port=args.port, debug=False)
+    app.run(host="127.0.0.1", port=args.port, debug=False)
 
 
 if __name__ == "__main__":
