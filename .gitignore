@@ -1,0 +1,10 @@
+.memsearch/
+locomo_test_kit.egg-info/
+uv.lock
+test_results/
+
+configs/env.toml
+configs/ogmem-small.toml
+**/__pycache__/
+models/
+draft/
