@@ -1,74 +1,86 @@
-# locomo-test-kit
+# locomo-test
 
-用这套脚本跑 LoCoMo small 测试。下面以 `ogmem` 为例，用户拿到测试文件后按顺序执行即可。
+LoCoMo small 测试套件。使用 `app.py` 管理环境。
 
-## 1. 准备环境
+## 环境要求
 
-进入测试目录：
+- Docker
+- Python 3.10+
+- `uv` (推荐) 或 `pip`
 
-```bash
-cd /data1/sundechao/omv2/locomo/openclaw
-```
-
-安装依赖：
+## 安装依赖
 
 ```bash
-python3 -m pip install -e .
-python3 -m locomo_test.cli --help
+uv sync
 ```
 
-需要提前准备：
-
-- Docker 可用。
-- `ogmem:520` 镜像可用。
-- `openclaw-ogmemory:poc1_416` 镜像可拉取。
-- Judge LLM 的 `api_key`、`base_url`、`model`。
-
-## 2. 启动 ogmem 和 openclaw
+## 快速开始
 
 ```bash
-docker rm -f ogmem 2>/dev/null || true
-docker run -d --name ogmem --network host \
-  -v /data1/sundechao/ogmem/testfs/ogmemory.yaml:/etc/ogmem/config.yaml:ro \
-  -v /data1/sundechao/ogmem/testfs/ogmem:/data/agfs \
-  ogmem:520
+# 查看状态
+uv run app.py status
 
-docker rm -f openclaw_ogmem 2>/dev/null || true
-mkdir -p /data1/sundechao/ogmem/testfs/ogmem_ws
-docker run -d --name openclaw_ogmem --network host \
-  -v /data1/sundechao/ogmem/testfs/openclaw:/home/node/.openclaw \
-  -v /data1/sundechao/ogmem/testfs/openclaw.json:/home/node/.openclaw/openclaw.json \
-  -v /data1/sundechao/ogmem/testfs/ogmem_ws:/tmp/ogmem_ws \
-  swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/openclaw-ogmemory:poc1_416
+# 启动 embedding 服务
+uv run app.py start
+
+# 运行测试
+python -m locomo_test.cli run configs/ogmem-small.toml
+
+# 清理环境
+./clean.sh
 ```
 
-检查服务：
+## 服务管理
+
+### 查看状态
 
 ```bash
-curl -s http://127.0.0.1:8090/api/v1/health
-curl -s http://127.0.0.1:18790/health
-docker logs --tail 100 openclaw_ogmem 2>&1 | grep 'remote services verified'
+uv run python app.py status
 ```
 
-## 3. 配置测试
+显示 Docker 容器状态和 embedding 服务端口。
 
-复制环境配置：
+### 启动/停止 Embedding 服务
+
+```bash
+uv run python app.py start   # 启动 (默认端口 8000)
+uv run python app.py stop    # 停止
+uv run python app.py test   # 测试 embedding 服务
+```
+
+Embedding 服务由 `deploy_model.py` 提供，默认使用 `BAAI/bge-small-en-v1.5` 模型。
+
+### 清理环境
+
+```bash
+./clean.sh
+```
+
+清理内容：
+- Docker 容器停止/重启
+- OpenClaw sessions、archive、agent、tasks、logs
+- AGFS 数据
+- 测试结果
+
+## 运行测试
+
+### 1. 配置环境
 
 ```bash
 cp configs/env.toml.example configs/env.toml
 ```
 
-编辑 `configs/env.toml`，至少填这些值：
+编辑 `configs/env.toml`：
 
 ```toml
 [gateway]
 port = 18790
 token = "<openclaw auth token>"
-state_dir = "/data1/sundechao/ogmem/testfs/openclaw"
+state_dir = "/home/yuanjian/.../openclaw_dir"
 
 [ogmem]
 api_url = "http://127.0.0.1:8090"
-docker_container = "ogmem"
+docker_container = "ogmem_yuanjian"
 wait_timeout = 900
 wait_interval = 2.0
 log_tail = 500
@@ -81,7 +93,9 @@ api_format = "openai"
 parallel = 5
 ```
 
-创建 `configs/ogmem-small.toml`：
+### 2. 创建测试配置
+
+`configs/ogmem-small.toml`：
 
 ```toml
 [general]
@@ -92,7 +106,7 @@ memory_mode = "ogmem"
 parallel = 1
 user = "ogmem-small"
 agent_id = "main"
-output_dir = "/data1/sundechao/omv2/locomo/openclaw/output"
+output_dir = "output"
 
 [session]
 policy = "isolated"
@@ -105,95 +119,76 @@ judge = true
 stats = true
 ```
 
-## 4. 可选：清理旧数据
-
-如果要干净重跑，先清理：
+### 3. 运行
 
 ```bash
-rm -rf /data1/sundechao/ogmem/testfs/openclaw/agents/main/sessions/*
-rm -rf /data1/sundechao/ogmem/testfs/openclaw/agents/main/archive/*
-rm -rf /data1/sundechao/ogmem/testfs/openclaw/agents/main/agent/*
-rm -rf /data1/sundechao/ogmem/testfs/openclaw/tasks/*
-rm -rf /data1/sundechao/ogmem/testfs/openclaw/logs/*
-rm -rf /data1/sundechao/ogmem/testfs/ogmem/*
-rm -rf /data1/sundechao/ogmem/testfs/ogmem_ws/*
-rm -rf output/ogmem-small
+# 健康检查
+python -m locomo_test.cli check configs/ogmem-small.toml
 
-docker restart ogmem
-docker restart openclaw_ogmem
+# 完整测试
+python -m locomo_test.cli run configs/ogmem-small.toml
+
+# 只跑 ingest + QA
+python -m locomo_test.cli run configs/ogmem-small.toml --only health_check,ingest,qa
 ```
 
-## 5. 运行测试
-
-先做健康检查：
+## 查看结果
 
 ```bash
-python3 -m locomo_test.cli check configs/ogmem-small.toml
-```
-
-跑完整 small：
-
-```bash
-python3 -m locomo_test.cli run configs/ogmem-small.toml
-```
-
-只验证 ingest 和 QA，不跑 judge：
-
-```bash
-python3 -m locomo_test.cli run configs/ogmem-small.toml --only health_check,ingest,qa
-```
-
-## 6. 查看进度和结果
-
-看流水线日志：
-
-```bash
+# 实时日志
 tail -f output/ogmem-small/pipeline.log
-```
 
-看 ogmem 每个 session 是否抽取完成：
+# 最终结果
+cat output/ogmem-small/meta.json | python -m json.tool
 
-```bash
-docker logs --since 30m ogmem 2>&1 | grep 'after_turn background extract done'
-```
-
-不要只用 `docker logs --tail 500 ogmem` 查历史完成日志，QA 阶段日志很多，可能把 ingest 阶段日志挤出最后 500 行。
-
-看最终结果：
-
-```bash
-python3 -m json.tool output/ogmem-small/meta.json
-```
-
-主要输出文件：
-
-```text
-output/ogmem-small/qa_results.csv
-output/ogmem-small/meta.json
-output/ogmem-small/pipeline.log
+# QA 结果
+cat output/ogmem-small/qa_results.csv
 ```
 
 ## 常见问题
 
-如果健康检查失败：
+### 健康检查失败
 
 ```bash
-docker logs --tail 100 ogmem
-docker logs --tail 100 openclaw_ogmem
+docker logs --tail 100 ogmem_yuanjian
+docker logs --tail 100 openclaw_ogmem_yuanjian
 ```
 
-如果 ingest 看起来慢，先看：
+### Embedding 服务 400 错误
 
-```bash
-tail -f output/ogmem-small/pipeline.log
-docker logs --since 30m ogmem 2>&1 | grep 'after_turn background extract done'
-curl -s http://127.0.0.1:8090/api/v1/token_stats | python3 -m json.tool
+确保 oG-Memory 配置中的 embedding `base_url` 是 HTTP：
+
+```yaml
+# ogmemory.yaml
+embedding:
+  base_url: "http://127.0.0.1:8000/v1/"
 ```
 
-`ogmem` 模式会等每个 session 的 `after_turn background extract done` 后再继续下一个 session，所以 ingest 时间主要取决于 ogmem 后台抽取耗时。
+### 代理问题
 
-如果代理导致请求失败，运行前清掉代理：
+如果代理导致请求失败：
 
 ```bash
 unset https_proxy HTTP_PROXY http_proxy HTTPS_PROXY all_proxy ALL_PROXY
+```
+
+## 自定义路径
+
+通过环境变量设置非默认路径：
+
+```bash
+OPENCLAW_DIR=/path/to/openclaw AGFS_DATA_DIR=/path/to/agfs uv run python app.py clean
+```
+
+## 目录结构
+
+```
+.
+├── app.py              # 环境管理工具
+├── clean.sh            # 清理脚本 (调用 app.py)
+├── deploy_model.py     # Embedding 服务
+├── configs/            # 测试配置
+├── data/               # 测试数据
+├── models/             # 模型缓存
+└── output/             # 测试输出
 ```
