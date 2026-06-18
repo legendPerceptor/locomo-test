@@ -60,6 +60,11 @@ def run_cmd(cmd: list[str], capture: bool = True) -> tuple[int, str, str]:
         return -1, "", str(e)
 
 
+def is_root() -> bool:
+    """Check if running as root."""
+    return os.geteuid() == 0
+
+
 def docker_ps() -> dict[str, dict]:
     """Get docker ps output as dict."""
     code, out, _ = run_cmd(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"])
@@ -175,9 +180,21 @@ def cmd_clean():
 
     for dir_path in dirs_to_clean:
         if dir_path.exists():
-            # Use find to handle non-empty directories
-            code, _, _ = run_cmd(["rm", "-rf", f"{dir_path}/."])
-            print(f"  Cleaned {dir_path}")
+            # Remove and recreate the directory
+            rm_cmd = ["rm", "-rf", str(dir_path)]
+            mkdir_cmd = ["mkdir", "-p", str(dir_path)]
+            if not is_root():
+                rm_cmd.insert(0, "sudo")
+                mkdir_cmd.insert(0, "sudo")
+
+            code1, out1, e1 = run_cmd(rm_cmd)
+            code2, _, e2 = run_cmd(mkdir_cmd)
+            if code1 != 0:
+                print(f"  Failed to clean {dir_path}, rm returned {code1}: {e1 or out1}")
+            elif code2 == -1:
+                print(f"  Failed to recreate {dir_path}, error info: {e2}")
+            else:
+                print(f"  Cleaned {dir_path}")
 
     # Restart containers
     print("\n🔄 Starting containers...")
