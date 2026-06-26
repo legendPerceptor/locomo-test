@@ -18,27 +18,27 @@ uv sync
 ## 快速开始
 
 ```bash
-# 查看状态
-uv run app.py status
-
-# 启动 embedding 服务（本机临时进程）
-uv run app.py start
-
-# 或用 Docker Compose 启动 embedding 服务（推荐给其他机器访问）
+# 1. 配置 embedding 服务
 cp .env.example .env
-# 编辑 .env，把 EMBEDDING_API_KEY 改成自己的 token
+# 编辑 .env，把 EMBEDDING_API_KEY 改成自己的 token；必要时调整 EMBEDDING_PORT/EMBEDDING_MODEL
+
+# 2. 用 Docker Compose 启动 embedding 服务
 docker compose up -d --build
 
-# 运行测试
+# 3. 查看服务状态和日志
+docker compose ps
+docker compose logs -f embedding-service
+
+# 4. 运行测试
 python -m locomo_test.cli run configs/ogmem-small.toml
 
-# 清理环境
+# 5. 清理环境
 ./clean.sh
 ```
 
 ## Docker Compose 部署 Embedding 服务
 
-推荐用 Docker Compose 把 `deploy_model.py` 包装成长期运行的 Web 服务。服务默认监听容器内 `8000`，映射到宿主机 `${EMBEDDING_PORT:-8000}`，其他机器可通过 `http://<宿主机IP>:8000` 访问。
+推荐用 Docker Compose 把 `deploy_model.py` 包装成长期运行的 Web 服务。服务默认监听容器内 `8000`，并通过 `.env` 里的 `EMBEDDING_PORT` 映射到宿主机端口；其他机器可通过 `http://<宿主机IP>:<EMBEDDING_PORT>` 访问。`uv run app.py start` 仍可用于本机临时调试，但不再作为推荐部署方式。
 
 ### 1. 准备配置
 
@@ -109,23 +109,36 @@ docker compose up -d --build
 
 ## 服务管理
 
-### 查看状态
+### 推荐：Docker Compose 管理 Embedding 服务
+
+```bash
+# 启动/重建
+cp .env.example .env  # 首次使用时执行
+docker compose up -d --build
+
+# 查看状态
+docker compose ps
+
+# 查看日志
+docker compose logs -f embedding-service
+tail -f logs/embedding-service.log
+
+# 停止服务
+docker compose down
+```
+
+### 可选：本机临时进程管理
+
+如果只是在当前机器上快速调试，也可以继续用 `app.py` 启动本机进程：
 
 ```bash
 uv run python app.py status
-```
-
-显示 Docker 容器状态和 embedding 服务端口。
-
-### 启动/停止 Embedding 服务（本机临时进程）
-
-```bash
 uv run python app.py start   # 启动 (默认端口 8000)
 uv run python app.py stop    # 停止
 uv run python app.py test    # 测试 embedding 服务
 ```
 
-Embedding 服务由 `deploy_model.py` 提供，默认使用 `BAAI/bge-large-zh-v1.5` 模型。给其他机器长期访问时，推荐使用上面的 Docker Compose 方式。
+Embedding 服务由 `deploy_model.py` 提供，默认使用 `BAAI/bge-large-zh-v1.5` 模型。给其他机器长期访问时，推荐使用 Docker Compose。
 
 ### 清理环境
 
@@ -240,12 +253,12 @@ docker compose logs --tail 100 embedding-service
 
 ### Embedding 服务 400 错误
 
-确保 oG-Memory 配置中的 embedding `base_url` 是 HTTP：
+确保 oG-Memory 配置中的 embedding `base_url` 是 HTTP，并且端口使用 `.env` 中的 `EMBEDDING_PORT`：
 
 ```yaml
 # ogmemory.yaml
 embedding:
-  base_url: "http://127.0.0.1:8000/v1/"
+  base_url: "http://127.0.0.1:<EMBEDDING_PORT>/v1/"
 ```
 
 如果启用了 `EMBEDDING_API_KEY`，客户端还需要携带：
