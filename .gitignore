@@ -7,4 +7,6 @@ configs/env.toml
 configs/ogmem-*.toml
 **/__pycache__/
 models/
+logs/
 draft/
+.env

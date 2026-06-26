@@ -1,0 +1,26 @@
+services:
+  embedding-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: locomo-embedding-service:latest
+    container_name: locomo_embedding_service
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      EMBEDDING_HOST: 0.0.0.0
+      EMBEDDING_PORT: 8000
+      EMBEDDING_CACHE_DIR: /app/models
+      EMBEDDING_LOG_FILE: /app/logs/embedding-service.log
+    ports:
+      - "${EMBEDDING_PORT:-8000}:8000"
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
