@@ -127,7 +127,36 @@ tail -f logs/embedding-service.log
 docker compose down
 ```
 
-### 可选：本机临时进程管理
+### 可选：不用 Docker，直接启动 `deploy_model.py`
+
+如果只是临时部署或机器上已经配好了 Python/uv 环境，也可以不用 Docker，直接启动模型服务：
+
+```bash
+# 推荐带 API Key，对外提供服务时更安全
+EMBEDDING_API_KEY=<你的 token> uv run deploy_model.py --host 0.0.0.0 --port 4392
+
+# 仅可信内网/本机调试时，也可以不设置 API Key
+uv run deploy_model.py --host 0.0.0.0 --port 4392
+```
+
+服务会在前台运行，按 `Ctrl+C` 停止。日志默认写到 `logs/embedding-service.log`，同时也会输出到终端：
+
+```bash
+tail -f logs/embedding-service.log
+```
+
+访问方式和 Docker 部署一致，只是端口换成启动时指定的端口：
+
+```bash
+curl http://127.0.0.1:4392/v1/embeddings \
+  -H "Authorization: Bearer <你的 token>" \
+  -H "Content-Type: application/json" \
+  -d '{"input":"你好世界"}'
+```
+
+如果其他机器要访问，把 `127.0.0.1` 换成宿主机 IP，并确认防火墙/安全组开放了 `4392` 端口。长期稳定对外提供服务时，仍推荐使用 Docker Compose，方便重启、健康检查和日志管理。
+
+### 可选：本机 `app.py` 临时进程管理
 
 如果只是在当前机器上快速调试，也可以继续用 `app.py` 启动本机进程：
 
@@ -138,7 +167,7 @@ uv run python app.py stop    # 停止
 uv run python app.py test    # 测试 embedding 服务
 ```
 
-Embedding 服务由 `deploy_model.py` 提供，默认使用 `BAAI/bge-large-zh-v1.5` 模型。给其他机器长期访问时，推荐使用 Docker Compose。
+Embedding 服务由 `deploy_model.py` 提供，默认使用 `BAAI/bge-large-zh-v1.5` 模型。给其他机器长期访问时，推荐使用 Docker Compose；临时部署可以直接运行 `uv run deploy_model.py --host 0.0.0.0 --port 4392`。
 
 ### 清理环境
 
