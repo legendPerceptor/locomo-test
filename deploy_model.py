@@ -48,7 +48,7 @@ DEFAULT_LOG_FILE = os.environ.get(
     "EMBEDDING_LOG_FILE",
     str(Path(__file__).parent / "logs" / "embedding-service.log"),
 )
-DEFAULT_API_KEY = os.environ.get("EMBEDDING_API_KEY", "dummy")
+DEFAULT_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
 
 logger = logging.getLogger("embedding_service")
 
