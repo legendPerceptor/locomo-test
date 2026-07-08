@@ -105,6 +105,7 @@ def run_pipeline(
     print(f"{'='*60}\n", file=sys.stderr)
 
     memory_token_totals: dict | None = None
+    ingest_token_totals: dict | None = None
 
     for step, enabled in active:
         if not enabled:
@@ -120,7 +121,7 @@ def run_pipeline(
                 sys.exit(1)
 
         elif step == "ingest":
-            _, memory_token_totals = run_ingest(cfg, output_dir)
+            _, memory_token_totals, ingest_token_totals = run_ingest(cfg, output_dir)
 
         elif step == "qa":
             run_qa(cfg, output_dir)
@@ -133,7 +134,12 @@ def run_pipeline(
             report_issues("judge", issues)
 
         elif step == "stats":
-            run_stats(cfg, output_dir, memory_token_totals=memory_token_totals)
+            run_stats(
+                cfg,
+                output_dir,
+                memory_token_totals=memory_token_totals,
+                ingest_token_totals=ingest_token_totals,
+            )
 
         elapsed = time.time() - t0
         print(f"  [{step}] done in {elapsed:.1f}s", file=sys.stderr)

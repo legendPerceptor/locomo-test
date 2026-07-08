@@ -225,6 +225,60 @@ def reset_session(session_path: str, agent_id: str = "main", state_dir: str = ""
         return None
 
 
+def _usage_int(*values) -> int:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def normalize_usage(raw_usage: dict | None) -> dict:
+    """Normalize OpenClaw/OpenAI-compatible provider usage fields."""
+    raw_usage = raw_usage or {}
+    prompt_details = raw_usage.get("prompt_tokens_details") or {}
+    input_details = raw_usage.get("input_tokens_details") or {}
+
+    return {
+        "input_tokens": _usage_int(
+            raw_usage.get("input_tokens"),
+            raw_usage.get("input"),
+            raw_usage.get("prompt_tokens"),
+        ),
+        "output_tokens": _usage_int(
+            raw_usage.get("output_tokens"),
+            raw_usage.get("output"),
+            raw_usage.get("completion_tokens"),
+        ),
+        "cacheRead": _usage_int(
+            raw_usage.get("cacheRead"),
+            raw_usage.get("cache_read"),
+            prompt_details.get("cached_tokens"),
+            input_details.get("cached_tokens"),
+        ),
+        "cacheWrite": _usage_int(
+            raw_usage.get("cacheWrite"),
+            raw_usage.get("cache_write"),
+            raw_usage.get("cache_creation_input_tokens"),
+            input_details.get("cache_creation_tokens"),
+        ),
+        "total_tokens": _usage_int(
+            raw_usage.get("total_tokens"),
+            raw_usage.get("totalTokens"),
+            raw_usage.get("total"),
+        ),
+    }
+
+
+def _add_usage_totals(total: dict, usage: dict | None) -> None:
+    normalized = normalize_usage(usage)
+    for key in total:
+        total[key] += normalized.get(key, 0)
+
+
 def calculate_usage_from_jsonl(jsonl_path: str) -> dict:
     usage = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
     if not os.path.exists(jsonl_path):
@@ -236,12 +290,12 @@ def calculate_usage_from_jsonl(jsonl_path: str) -> dict:
                     continue
                 entry = json.loads(line)
                 if entry.get("type") == "message" and entry.get("message", {}).get("role") == "assistant":
-                    eu = entry.get("message", {}).get("usage", {})
-                    usage["input_tokens"] += eu.get("input", 0)
-                    usage["output_tokens"] += eu.get("output", 0)
-                    usage["cacheRead"] += eu.get("cacheRead", 0)
-                    usage["cacheWrite"] += eu.get("cacheWrite", 0)
-                    usage["total_tokens"] += eu.get("totalTokens", 0)
+                    eu = normalize_usage(entry.get("message", {}).get("usage", {}))
+                    usage["input_tokens"] += eu["input_tokens"]
+                    usage["output_tokens"] += eu["output_tokens"]
+                    usage["cacheRead"] += eu["cacheRead"]
+                    usage["cacheWrite"] += eu["cacheWrite"]
+                    usage["total_tokens"] += eu["total_tokens"]
     except (json.JSONDecodeError, IOError):
         pass
     return usage
@@ -298,7 +352,7 @@ def send_message(
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Error parsing response: {e}")
 
-    usage = body.get("usage", {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "total_tokens": 0})
+    usage = normalize_usage(body.get("usage"))
     return extract_response_text(body), usage
 
 
@@ -342,12 +396,17 @@ def _parse_ov_task_result(data: dict) -> dict | None:
     }
 
 
-def query_ov_task_token_usage(ov_api_url: str, task_id: str, max_wait: int = 60) -> dict | None:
+def _ov_auth_headers(api_key: str = "") -> dict | None:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+
+def query_ov_task_token_usage(ov_api_url: str, task_id: str, api_key: str = "", max_wait: int = 60) -> dict | None:
     deadline = time.time() + max_wait
     interval = 2
+    headers = _ov_auth_headers(api_key)
     try:
         while True:
-            resp = requests.get(f"{ov_api_url}/api/v1/tasks/{task_id}", timeout=30)
+            resp = requests.get(f"{ov_api_url}/api/v1/tasks/{task_id}", headers=headers, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             status = data.get("result", {}).get("status", "") if isinstance(data.get("result"), dict) else ""
@@ -362,12 +421,12 @@ def query_ov_task_token_usage(ov_api_url: str, task_id: str, max_wait: int = 60)
         return None
 
 
-def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None) -> dict | None:
+def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None, api_key: str = "") -> dict | None:
     try:
         params = {"task_type": "session_commit", "status": "completed", "limit": 1}
         if resource_id:
             params["resource_id"] = resource_id
-        resp = requests.get(f"{ov_api_url}/api/v1/tasks", params=params, timeout=30)
+        resp = requests.get(f"{ov_api_url}/api/v1/tasks", params=params, headers=_ov_auth_headers(api_key), timeout=30)
         resp.raise_for_status()
         data = resp.json()
         tasks = data.get("result", [])
@@ -607,8 +666,8 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
 # Ingest
 # ---------------------------------------------------------------------------
 
-def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
-    """Load conversations into OpenClaw. Returns (result entries, memory_token_totals)."""
+def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
+    """Load conversations into OpenClaw. Returns (result entries, memory_token_totals, ingest_token_totals)."""
     record_path = os.path.join(output_dir, ".ingest_record.json")
     ingest_record = load_ingest_record(record_path)
 
@@ -617,6 +676,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
     skipped = 0
     policy = cfg.session.policy
     memory_token_totals = _empty_memory_token_totals(cfg.memory_mode)
+    ingest_token_totals = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
 
     for item in samples:
         sample_id = item["sample_id"]
@@ -640,6 +700,9 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                 oc_session_key = build_ingest_session_key(sample_id, meta["session_key"])
 
             if is_already_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record):
+                record_key = f"{cfg.agent_id}:{user_key}:{sample_id}:{meta['session_key']}"
+                old_usage = ingest_record.get(record_key, {}).get("meta", {}).get("usage", {})
+                _add_usage_totals(ingest_token_totals, old_usage)
                 print(f"  [{label}] [SKIP] already ingested", file=sys.stderr)
                 skipped += 1
                 continue
@@ -675,6 +738,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                     cfg.gateway.base_url, cfg.gateway.token, user_key,
                     ingest_msg, 2, cfg.agent_id, oc_session_key,
                 )
+                _add_usage_totals(ingest_token_totals, usage)
                 print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
 
                 memory_token_usage = None
@@ -685,10 +749,18 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
                     if compact_result and compact_result.get("compacted") and cfg.openviking.api_url:
                         task_id = compact_result.get("taskId")
                         if task_id:
-                            ov_token_usage = query_ov_task_token_usage(cfg.openviking.api_url, task_id)
+                            ov_token_usage = query_ov_task_token_usage(
+                                cfg.openviking.api_url,
+                                task_id,
+                                cfg.openviking.api_key,
+                            )
                         if not ov_token_usage:
                             sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
-                            ov_token_usage = query_ov_latest_task(cfg.openviking.api_url, resource_id=sid)
+                            ov_token_usage = query_ov_latest_task(
+                                cfg.openviking.api_url,
+                                resource_id=sid,
+                                api_key=cfg.openviking.api_key,
+                            )
                         if ov_token_usage:
                             print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
                             memory_token_usage = {"provider": "openviking", **ov_token_usage}
@@ -746,6 +818,14 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
 
     save_ingest_record(ingest_record, record_path)
     print(f"\n=== Ingest summary: {len(results)} completed, {skipped} skipped ===", file=sys.stderr)
+    print(
+        f"  Ingest tokens: in={ingest_token_totals['input_tokens']:,} "
+        f"out={ingest_token_totals['output_tokens']:,} "
+        f"cacheRead={ingest_token_totals['cacheRead']:,} "
+        f"cacheWrite={ingest_token_totals['cacheWrite']:,} "
+        f"total={ingest_token_totals['total_tokens']:,}",
+        file=sys.stderr,
+    )
 
     if memory_token_totals["llm_total"] or memory_token_totals["embedding"]:
         label = "OV" if memory_token_totals.get("provider") == "openviking" else "oGMemory"
@@ -763,7 +843,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict]:
         except Exception as e:
             print(f"  Index warmup failed (non-fatal): {e}", file=sys.stderr)
 
-    return results, memory_token_totals
+    return results, memory_token_totals, ingest_token_totals
 
 
 # ---------------------------------------------------------------------------
@@ -823,13 +903,7 @@ def _process_single_question(
             # Now archive the session
             jsonl_filename = reset_session(jsonl_path, cfg.agent_id, cfg.gateway.state_dir) or ""
         else:
-            usage = {
-                "input_tokens": api_usage.get("input_tokens", 0),
-                "output_tokens": api_usage.get("output_tokens", 0),
-                "cacheRead": api_usage.get("cacheRead", 0),
-                "cacheWrite": api_usage.get("cacheWrite", 0),
-                "total_tokens": api_usage.get("total_tokens", 0),
-            }
+            usage = api_usage
     except Exception as e:
         print(f"  [{sample_idx}]   [FATAL] QA failed: {e}", file=sys.stderr)
         raise

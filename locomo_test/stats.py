@@ -18,6 +18,7 @@ def run_stats(
     *,
     memory_token_totals: dict | None = None,
     ov_token_totals: dict | None = None,
+    ingest_token_totals: dict | None = None,
 ):
     """Compute accuracy by category, token totals, write meta.json."""
     if memory_token_totals is None:
@@ -66,6 +67,15 @@ def run_stats(
         acc = s["correct"] / s["total"] if s["total"] else 0
         print(f"  {cat:<10} {s['correct']:<10} {s['total']:<10} {acc:.2%}", file=sys.stderr)
     print(f"  {'-'*40}", file=sys.stderr)
+    if ingest_token_totals:
+        print(
+            f"  Ingest tokens: in={ingest_token_totals.get('input_tokens', 0):,} "
+            f"out={ingest_token_totals.get('output_tokens', 0):,} "
+            f"cacheRead={ingest_token_totals.get('cacheRead', 0):,} "
+            f"cacheWrite={ingest_token_totals.get('cacheWrite', 0):,} "
+            f"total={ingest_token_totals.get('total_tokens', 0):,}",
+            file=sys.stderr,
+        )
     print(f"  QA tokens: in={token_totals['input_tokens']:,} out={token_totals['output_tokens']:,} cacheRead={token_totals['cacheRead']:,} total={token_totals['total_tokens']:,}", file=sys.stderr)
     if total_correct > 0:
         tok_per_correct = token_totals["total_tokens"] / total_correct
@@ -106,6 +116,7 @@ def run_stats(
             }
             for cat, s in sorted(cat_stats.items())
         },
+        "ingest_token_totals": ingest_token_totals or {},
         "token_totals": token_totals,
         "memory_token_totals": memory_token_totals or {},
         "ov_token_totals": memory_token_totals if memory_provider == "openviking" else {},

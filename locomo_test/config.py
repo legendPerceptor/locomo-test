@@ -35,6 +35,7 @@ class GatewayEnv:
 class OpenVikingEnv:
     port: int = 2936
     api_url: str = ""  # derived from port if empty
+    api_key: str = ""
 
     def __post_init__(self):
         if not self.api_url:
@@ -193,6 +194,7 @@ def load_config(test_toml_path: str) -> Config:
     cfg.openviking = OpenVikingEnv(
         port=ov.get("port", 2936),
         api_url=ov.get("api_url", ""),
+        api_key=ov.get("api_key", os.environ.get("OPENVIKING_API_KEY", "")),
     )
 
     # --- ogmem ---
