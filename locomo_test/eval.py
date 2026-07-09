@@ -196,6 +196,23 @@ def get_session_id_from_key(session_key: str, user: str, agent_id: str = "main",
     return None
 
 
+def resolve_openclaw_session_file(session_file: str, sessions_dir: str) -> str:
+    """Resolve an OpenClaw sessionFile to a host-readable jsonl path."""
+    if not session_file:
+        return ""
+
+    raw = session_file if session_file.endswith(".jsonl") else f"{session_file}.jsonl"
+    candidates = [raw]
+    candidates.append(os.path.join(sessions_dir, os.path.basename(raw)))
+    if not os.path.isabs(session_file):
+        candidates.append(os.path.join(sessions_dir, raw))
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return candidates[-1]
+
+
 def get_session_id(user: str, agent_id: str = "main", state_dir: str = "") -> str | None:
     sessions_file = os.path.join(state_dir, "agents", agent_id, "sessions", "sessions.json")
     try:
@@ -468,6 +485,8 @@ def _ogmem_token_delta(before: dict, after: dict) -> dict:
     llm_prompt = int(after_llm.get("input_tokens", 0) or 0) - int(before_llm.get("input_tokens", 0) or 0)
     llm_completion = int(after_llm.get("output_tokens", 0) or 0) - int(before_llm.get("output_tokens", 0) or 0)
     llm_total = int(after_llm.get("total_tokens", 0) or 0) - int(before_llm.get("total_tokens", 0) or 0)
+    llm_cache_read = int(after_llm.get("cache_read", 0) or 0) - int(before_llm.get("cache_read", 0) or 0)
+    llm_cache_write = int(after_llm.get("cache_write", 0) or 0) - int(before_llm.get("cache_write", 0) or 0)
     embedding = int(after_embed.get("total_tokens", 0) or 0) - int(before_embed.get("total_tokens", 0) or 0)
     llm_calls = int(after_llm.get("calls", 0) or 0) - int(before_llm.get("calls", 0) or 0)
     embedding_calls = int(after_embed.get("calls", 0) or 0) - int(before_embed.get("calls", 0) or 0)
@@ -477,6 +496,8 @@ def _ogmem_token_delta(before: dict, after: dict) -> dict:
         "llm_prompt": max(0, llm_prompt),
         "llm_completion": max(0, llm_completion),
         "llm_total": max(0, llm_total),
+        "llm_cache_read": max(0, llm_cache_read),
+        "llm_cache_write": max(0, llm_cache_write),
         "embedding": max(0, embedding),
         "memories": 0,
         "llm_calls": max(0, llm_calls),
@@ -490,6 +511,8 @@ def _empty_memory_token_totals(provider: str) -> dict:
         "llm_prompt": 0,
         "llm_completion": 0,
         "llm_total": 0,
+        "llm_cache_read": 0,
+        "llm_cache_write": 0,
         "embedding": 0,
         "memories": 0,
         "llm_calls": 0,
@@ -500,7 +523,17 @@ def _empty_memory_token_totals(provider: str) -> dict:
 def _add_memory_token_usage(total: dict, delta: dict | None) -> None:
     if not delta:
         return
-    for key in ("llm_prompt", "llm_completion", "llm_total", "embedding", "memories", "llm_calls", "embedding_calls"):
+    for key in (
+        "llm_prompt",
+        "llm_completion",
+        "llm_total",
+        "llm_cache_read",
+        "llm_cache_write",
+        "embedding",
+        "memories",
+        "llm_calls",
+        "embedding_calls",
+    ):
         total[key] = int(total.get(key, 0) or 0) + int(delta.get(key, 0) or 0)
 
 
@@ -778,6 +811,8 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
                     memory_token_usage = _ogmem_token_delta(ogmem_tokens_before or {}, ogmem_tokens_after)
                     print(
                         f"    [ogmem-token] llm={memory_token_usage['llm_total']:,} "
+                        f"cacheRead={memory_token_usage['llm_cache_read']:,} "
+                        f"cacheWrite={memory_token_usage['llm_cache_write']:,} "
                         f"embed={memory_token_usage['embedding']:,}",
                         file=sys.stderr,
                     )
@@ -807,9 +842,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
                 found = get_session_id_from_key(oc_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
                 if found:
                     sf, sdir = found
-                    sf_path = sf if os.path.isabs(sf) else os.path.join(sdir, sf)
-                    if not sf_path.endswith(".jsonl"):
-                        sf_path += ".jsonl"
+                    sf_path = resolve_openclaw_session_file(sf, sdir)
                     reset_session(sf_path, cfg.agent_id, cfg.gateway.state_dir)
             elif policy == SessionPolicy.SHARED and cfg.memory_mode not in ("openviking", "ogmem"):
                 sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
@@ -831,6 +864,8 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
         label = "OV" if memory_token_totals.get("provider") == "openviking" else "oGMemory"
         print(
             f"  {label} totals: llm={memory_token_totals['llm_total']:,} "
+            f"cacheRead={memory_token_totals.get('llm_cache_read', 0):,} "
+            f"cacheWrite={memory_token_totals.get('llm_cache_write', 0):,} "
             f"embed={memory_token_totals['embedding']:,} memories={memory_token_totals['memories']}",
             file=sys.stderr,
         )
@@ -892,11 +927,7 @@ def _process_single_question(
             found = get_session_id_from_key(session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
             if found:
                 sf, qa_sessions_dir = found
-                # sf may be absolute path or just filename; may or may not have .jsonl
-                if os.path.isabs(sf):
-                    jsonl_path = sf if sf.endswith(".jsonl") else f"{sf}.jsonl"
-                else:
-                    jsonl_path = os.path.join(qa_sessions_dir, sf if sf.endswith(".jsonl") else f"{sf}.jsonl")
+                jsonl_path = resolve_openclaw_session_file(sf, qa_sessions_dir)
 
         if jsonl_path and os.path.exists(jsonl_path):
             usage = calculate_usage_from_jsonl(jsonl_path)

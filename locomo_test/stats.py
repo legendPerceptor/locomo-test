@@ -87,6 +87,8 @@ def run_stats(
             f"  {label} tokens: llm_prompt={memory_token_totals['llm_prompt']:,} "
             f"llm_completion={memory_token_totals['llm_completion']:,} "
             f"llm_total={memory_token_totals['llm_total']:,} "
+            f"llm_cache_read={memory_token_totals.get('llm_cache_read', 0):,} "
+            f"llm_cache_write={memory_token_totals.get('llm_cache_write', 0):,} "
             f"embed={memory_token_totals['embedding']:,} "
             f"memories={memory_token_totals['memories']:,}",
             file=sys.stderr,
