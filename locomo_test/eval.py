@@ -462,7 +462,28 @@ def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None, api_ke
 # oGMemory API / log helpers
 # ---------------------------------------------------------------------------
 
-OGMEM_EXTRACT_LOG_MARKER = "after_turn background extract done"
+OGMEM_EXTRACT_LOG_MARKERS = (
+    "after_turn background extract done",
+    "dispose background flush done",
+    "dispose flush skipped",
+)
+
+
+def _is_ogmem_extract_completion_log(line: str) -> bool:
+    if any(marker in line for marker in OGMEM_EXTRACT_LOG_MARKERS):
+        return True
+
+    # Some dispose no-op paths (for example no_pending_messages or
+    # no_user_messages) only emit the HTTP access log. Background flush dispatch
+    # returns a larger response and is followed by an explicit completion log.
+    dispose_marker = 'POST /api/v1/dispose HTTP/1.1" 200 '
+    if dispose_marker not in line:
+        return False
+    match = re.search(r'POST /api/v1/dispose HTTP/1\.1" 200 (\d+)', line)
+    if not match:
+        return False
+    response_bytes = int(match.group(1))
+    return response_bytes < 80
 
 
 def query_ogmem_token_stats(ogmem_api_url: str) -> dict:
@@ -557,7 +578,11 @@ def count_ogmem_after_turn_extract_logs(
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stdout.strip() or f"docker logs failed for {container}")
-    return sum(1 for line in proc.stdout.splitlines() if OGMEM_EXTRACT_LOG_MARKER in line)
+    return sum(
+        1
+        for line in proc.stdout.splitlines()
+        if _is_ogmem_extract_completion_log(line)
+    )
 
 
 def wait_for_ogmem_after_turn_extract(
@@ -575,12 +600,13 @@ def wait_for_ogmem_after_turn_extract(
     while time.time() < deadline:
         current_count = count_ogmem_after_turn_extract_logs(container, log_tail, since=since)
         if current_count > (0 if since is not None else baseline_count):
-            print(f"    [ogmem] after_turn background extract done ({session_key})", file=sys.stderr)
+            print(f"    [ogmem] memory extraction/flush done ({session_key})", file=sys.stderr)
             return {"completed": True, "baseline_count": baseline_count, "current_count": current_count}
         time.sleep(interval)
+    grep_pattern = "|".join(OGMEM_EXTRACT_LOG_MARKERS)
     raise RuntimeError(
         f"Timed out waiting for oGMemory extract completion for {session_key}. "
-        f"Check: docker logs --tail {log_tail} {container} 2>&1 | grep '{OGMEM_EXTRACT_LOG_MARKER}'"
+        f"Check: docker logs --tail {log_tail} {container} 2>&1 | grep -E '{grep_pattern}'"
     )
 
 
