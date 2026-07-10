@@ -374,17 +374,19 @@ def send_message(
 
 
 def send_message_with_retry(
-    base_url: str, token: str, user: str, message: str, retries: int = 2,
+    base_url: str, token: str, user: str, message: str, retries: int = 5,
     agent_id: str = "main", session_key: str | None = None,
 ) -> tuple[str, dict]:
     last_exc = None
+    rate_limit_waits = [10, 30, 60, 120, 180]
     for attempt in range(retries + 1):
         try:
             return send_message(base_url, token, user, message, agent_id, session_key)
         except Exception as e:
             last_exc = e
             if attempt < retries:
-                wait = 3 * (attempt + 1)
+                is_rate_limited = "429" in str(e)
+                wait = rate_limit_waits[attempt] if is_rate_limited and attempt < len(rate_limit_waits) else 3 * (attempt + 1)
                 print(f"    [retry {attempt + 1}/{retries}] {e} (waiting {wait}s)", file=sys.stderr)
                 time.sleep(wait)
     raise last_exc
