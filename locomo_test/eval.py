@@ -416,7 +416,14 @@ def _parse_ov_task_result(data: dict) -> dict | None:
 
 
 def _ov_auth_headers(api_key: str = "") -> dict | None:
-    return {"Authorization": f"Bearer {api_key}"} if api_key else None
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    account_id = os.environ.get("OPENVIKING_ACCOUNT_ID", "")
+    user_id = os.environ.get("OPENVIKING_USER_ID", "")
+    if account_id:
+        headers["X-OpenViking-Account"] = account_id
+    if user_id:
+        headers["X-OpenViking-User"] = user_id
+    return headers or None
 
 
 def query_ov_task_token_usage(ov_api_url: str, task_id: str, api_key: str = "", max_wait: int = 60) -> dict | None:

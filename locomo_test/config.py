@@ -194,7 +194,7 @@ def load_config(test_toml_path: str) -> Config:
     cfg.openviking = OpenVikingEnv(
         port=ov.get("port", 2936),
         api_url=ov.get("api_url", ""),
-        api_key=ov.get("api_key", os.environ.get("OPENVIKING_API_KEY", "")),
+        api_key=os.environ.get("OPENVIKING_API_KEY") or ov.get("api_key", ""),
     )
 
     # --- ogmem ---
