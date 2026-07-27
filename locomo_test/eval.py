@@ -343,6 +343,7 @@ def extract_response_text(response_json: dict) -> str:
 def send_message(
     base_url: str, token: str, user: str, message: str,
     agent_id: str = "main", session_key: str | None = None,
+    instructions: str | None = None,
 ) -> tuple[str, dict]:
     url = f"{base_url}/v1/responses"
     headers = {
@@ -355,6 +356,8 @@ def send_message(
     payload = {"model": "openclaw", "input": message, "stream": False}
     if user:
         payload["user"] = user
+    if instructions:
+        payload["instructions"] = instructions
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=6000)
@@ -376,12 +379,16 @@ def send_message(
 def send_message_with_retry(
     base_url: str, token: str, user: str, message: str, retries: int = 5,
     agent_id: str = "main", session_key: str | None = None,
+    instructions: str | None = None,
 ) -> tuple[str, dict]:
     last_exc = None
     rate_limit_waits = [10, 30, 60, 120, 180]
     for attempt in range(retries + 1):
         try:
-            return send_message(base_url, token, user, message, agent_id, session_key)
+            return send_message(
+                base_url, token, user, message, agent_id, session_key,
+                instructions=instructions,
+            )
         except Exception as e:
             last_exc = e
             if attempt < retries:
@@ -782,7 +789,16 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
 
             try:
                 ingest_msg = msg
-                if cfg.memory_mode == "memcore":
+                ingest_instructions = None
+                if cfg.memory_mode == "ogmem":
+                    ingest_instructions = (
+                        "The following is a historical conversation provided only for "
+                        "oGMemory ingestion. Do not call any tools. Do not read, create, "
+                        "or modify workspace files. Do not update MEMORY.md or memory/*.md. "
+                        "Do not perform bootstrap, git, or workspace setup. "
+                        "Reply exactly INGEST_OK."
+                    )
+                elif cfg.memory_mode == "memcore":
                     memory_prompt = (
                         "Extract key facts from the next group conversation and store them "
                         "in a SEPARATE memory file named memory/YYYY-MM-DD.md where YYYY-MM-DD "
@@ -805,6 +821,7 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
                 reply, usage = send_message_with_retry(
                     cfg.gateway.base_url, cfg.gateway.token, user_key,
                     ingest_msg, 2, cfg.agent_id, oc_session_key,
+                    instructions=ingest_instructions,
                 )
                 _add_usage_totals(ingest_token_totals, usage)
                 print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
