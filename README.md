@@ -132,11 +132,7 @@ docker compose down
 如果只是临时部署或机器上已经配好了 Python/uv 环境，也可以不用 Docker，直接启动模型服务：
 
 ```bash
-# 推荐带 API Key，对外提供服务时更安全
-EMBEDDING_API_KEY=<你的 token> uv run deploy_model.py --host 0.0.0.0 --port 4392
-
-# 仅可信内网/本机调试时，也可以不设置 API Key
-uv run deploy_model.py --host 0.0.0.0 --port 4392
+uv run deploy_model.py --host 0.0.0.0 --port 8831 --api-key dummy --log-file logs/embedding-0729.log
 ```
 
 服务会在前台运行，按 `Ctrl+C` 停止。日志默认写到 `logs/embedding-service.log`，同时也会输出到终端：

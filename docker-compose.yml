@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: locomo-embedding-service:latest
-    container_name: locomo_embedding_service
+    container_name: ${EMBEDDING_CONTAINER_NAME:-locomo_embedding_service}
     restart: unless-stopped
     env_file:
       - .env
@@ -13,6 +13,7 @@ services:
       EMBEDDING_PORT: 8000
       EMBEDDING_CACHE_DIR: /app/models
       EMBEDDING_LOG_FILE: /app/logs/embedding-service.log
+      HF_TOKEN: ${HF_TOKEN:-}
     ports:
       - "${EMBEDDING_PORT:-8000}:8000"
     volumes:
