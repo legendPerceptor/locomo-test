@@ -1,9 +1,14 @@
 FROM python:3.11-slim
 
-ARG http_proxy=${http_proxy:-http://172.17.0.1:1087}
-ARG https_proxy=${https_proxy:-http://172.17.0.1:1087}
+# Build runs with `build.network: host` so 127.0.0.1 in the build container
+# is the host's loopback. Runtime uses host.docker.internal (see
+# extra_hosts in docker-compose.yml).
+ARG http_proxy
+ARG https_proxy
+ARG all_proxy
 ENV http_proxy=${http_proxy}
 ENV https_proxy=${https_proxy}
+ENV all_proxy=${all_proxy}
 ENV no_proxy=localhost,127.0.0.1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
