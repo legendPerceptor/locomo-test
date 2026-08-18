@@ -12,10 +12,16 @@ dependencies = [
     "httpx[socks]>=0.27",
     "websocket-client>=1.6",
     "openai>=1.0",
+]
+
+[project.optional-dependencies]
+# Only needed for the local embedding service (deploy_model.py).
+# Not required to run the LoCoMo benchmark itself.
+# Install with `pip install ".[embedding]"` or `uv sync --extra embedding`.
+embedding = [
     "sentence-transformers>=2.2",
     "flask>=3.0",
     "numpy>=1.24",
-    "uvicorn[standard]"
 ]
 
 [project.scripts]

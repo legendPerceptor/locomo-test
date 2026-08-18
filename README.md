@@ -11,8 +11,10 @@ LoCoMo small 测试套件。使用 `app.py` 管理环境。
 
 ## 安装依赖
 
+默认只安装 LoCoMo 跑分所需的轻量依赖（`requests` / `httpx` / `websocket-client` / `openai`）。如果还要在本机直接跑 `deploy_model.py`（不通过 Docker），需要额外安装 embedding 相关依赖：
+
 ```bash
-uv sync
+uv sync --extra embedding
 ```
 
 ## 快速开始
@@ -132,6 +134,9 @@ docker compose down
 如果只是临时部署或机器上已经配好了 Python/uv 环境，也可以不用 Docker，直接启动模型服务：
 
 ```bash
+# 首次需要先把 sentence-transformers / flask / numpy 装上
+uv sync --extra embedding
+
 uv run deploy_model.py --host 0.0.0.0 --port 8831 --api-key dummy --log-file logs/embedding-0729.log
 ```
 

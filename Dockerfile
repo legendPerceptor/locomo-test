@@ -30,7 +30,7 @@ COPY locomo_test ./locomo_test
 COPY deploy_model.py ./
 
 RUN pip install --upgrade pip \
-    && pip install .
+    && pip install ".[embedding]"
 
 EXPOSE ${EMBEDDING_PORT:-8000}
 
