@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -582,7 +582,14 @@ def count_ogmem_after_turn_extract_logs(
     """Count oGMemory background extraction completion log lines."""
     cmd = ["docker", "logs", "--tail", str(log_tail)]
     if since is not None:
-        cmd.extend(["--since", str(max(0, int(since)))])
+        # Keep sub-second precision. Truncating to an integer Unix timestamp can
+        # include the previous session's completion marker when the next ingest
+        # starts within the same second, making the runner continue before the
+        # current session's extraction has actually finished.
+        since_arg = datetime.fromtimestamp(
+            max(0.0, since), tz=timezone.utc,
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        cmd.extend(["--since", since_arg])
     cmd.append(container)
     proc = subprocess.run(
         cmd,
