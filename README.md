@@ -143,6 +143,26 @@ python3 -m locomo_test.cli run configs/ogmem-small.toml
 python3 -m locomo_test.cli run configs/ogmem-small.toml --only health_check,ingest,qa
 ```
 
+如果中途停止后要从 QA 继续：
+
+```bash
+python3 -m locomo_test.cli run configs/ogmem-small.toml --resume
+```
+
+如果某些 ingest / QA 因为连接错误等原因失败，只补跑失败项：
+
+```bash
+python3 -m locomo_test.cli run configs/ogmem-small.toml --retry-failures
+```
+
+如果要在现有结果基础上，从 QA 继续并且只补跑失败项：
+
+```bash
+python3 -m locomo_test.cli run configs/ogmem-small.toml --resume --retry-failures
+```
+
+`--retry-failures` 会读取输出目录中的失败记录文件，只重跑失败的 session / question，不会重复跑已经成功的结果。
+
 ## 6. 查看进度和结果
 
 看流水线日志：
@@ -171,7 +191,17 @@ python3 -m json.tool output/ogmem-small/meta.json
 output/ogmem-small/qa_results.csv
 output/ogmem-small/meta.json
 output/ogmem-small/pipeline.log
+output/ogmem-small/.ingest_record.json
+output/ogmem-small/.ingest_failures.json
+output/ogmem-small/.qa_failures.json
 ```
+
+说明：
+
+- `qa_results.csv`：成功完成的 QA 结果
+- `.ingest_record.json`：成功完成的 ingest session 记录
+- `.ingest_failures.json`：仍待补跑的 ingest 失败项
+- `.qa_failures.json`：仍待补跑的 QA 失败项
 
 ## 常见问题
 
