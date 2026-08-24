@@ -15,7 +15,7 @@ def cmd_run(args):
     only = [s.strip() for s in args.only.split(",")] if args.only else None
     skip = [s.strip() for s in args.skip.split(",")] if args.skip else None
 
-    run_pipeline(cfg, only=only, skip=skip, resume=args.resume)
+    run_pipeline(cfg, only=only, skip=skip, resume=args.resume, retry_failures=args.retry_failures)
 
 
 def cmd_judge(args):
@@ -68,6 +68,7 @@ def main():
     p_run.add_argument("--only", default=None, help="Comma-separated steps to run (e.g. ingest,qa)")
     p_run.add_argument("--skip", default=None, help="Comma-separated steps to skip (e.g. judge)")
     p_run.add_argument("--resume", action="store_true", help="Skip health_check and ingest, resume from qa")
+    p_run.add_argument("--retry-failures", action="store_true", help="Only retry entries recorded in .ingest_failures.json / .qa_failures.json")
     p_run.set_defaults(func=cmd_run)
 
     # --- judge ---

@@ -33,6 +33,14 @@ def run_stats(
 
     # Filter category 5
     valid = [r for r in rows if r.get("category") != "5"]
+    failure_path = os.path.join(output_dir, ".qa_failures.json")
+    failure_count = 0
+    if os.path.exists(failure_path):
+        try:
+            with open(failure_path, "r", encoding="utf-8") as f:
+                failure_count = len(json.load(f))
+        except Exception:
+            failure_count = 0
 
     # Per-category stats
     cat_stats: dict[str, dict] = {}
@@ -49,6 +57,8 @@ def run_stats(
     total_correct = sum(s["correct"] for s in cat_stats.values())
     total_graded = sum(s["total"] for s in cat_stats.values())
     overall_acc = total_correct / total_graded if total_graded else 0.0
+    total_questions = len(valid) + failure_count
+    ungraded_questions = sum(1 for r in valid if not r.get("result")) + failure_count
 
     # Token totals
     token_keys = ["input_tokens", "output_tokens", "cacheRead", "cacheWrite", "total_tokens"]
@@ -80,6 +90,8 @@ def run_stats(
     if total_correct > 0:
         tok_per_correct = token_totals["total_tokens"] / total_correct
         print(f"  Tokens/correct: {tok_per_correct:,.0f}", file=sys.stderr)
+    if ungraded_questions:
+        print(f"  Pending QA questions (ungraded or missing): {ungraded_questions}", file=sys.stderr)
     if memory_token_totals and (memory_token_totals.get("llm_total") or memory_token_totals.get("embedding")):
         provider = memory_token_totals.get("provider") or cfg.memory_mode
         label = "OV" if provider == "openviking" else "oGMemory" if provider == "ogmem" else provider
@@ -109,7 +121,8 @@ def run_stats(
         "overall_accuracy": round(overall_acc, 4),
         "total_correct": total_correct,
         "total_graded": total_graded,
-        "total_questions": len(valid),
+        "total_questions": total_questions,
+        "pending_questions": total_questions - total_graded,
         "accuracy_by_category": {
             cat: {
                 "correct": s["correct"],

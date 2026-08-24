@@ -156,6 +156,22 @@ def save_ingest_record(record: dict, record_path: str) -> None:
         print(f"Warning: Error saving ingest record: {e}", file=sys.stderr)
 
 
+def load_failure_record(record_path: str) -> dict:
+    try:
+        with open(record_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        return {}
+
+
+def save_failure_record(record: dict, record_path: str) -> None:
+    try:
+        with open(record_path, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        print(f"Warning: Error saving failure record: {e}", file=sys.stderr)
+
+
 def is_already_ingested(agent_id: str, user_key: str, sample_id, session_key: str, record: dict) -> bool:
     key = f"{agent_id}:{user_key}:{sample_id}:{session_key}"
     return key in record and record[key].get("success", False)
@@ -164,6 +180,41 @@ def is_already_ingested(agent_id: str, user_key: str, sample_id, session_key: st
 def mark_ingested(agent_id: str, user_key: str, sample_id, session_key: str, record: dict, meta: dict | None = None):
     key = f"{agent_id}:{user_key}:{sample_id}:{session_key}"
     record[key] = {"success": True, "timestamp": int(time.time()), "meta": meta or {}}
+
+
+def record_failure(record: dict, key: str, *, phase: str, meta: dict | None = None) -> None:
+    previous = record.get(key, {})
+    record[key] = {
+        "success": False,
+        "phase": phase,
+        "timestamp": int(time.time()),
+        "fail_count": int(previous.get("fail_count", 0) or 0) + 1,
+        "meta": meta or {},
+    }
+
+
+def clear_failure(record: dict, key: str) -> None:
+    record.pop(key, None)
+
+
+def aggregate_ingest_records(record: dict) -> tuple[dict, dict]:
+    ingest_token_totals = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
+    memory_token_totals = None
+    for entry in record.values():
+        if not entry.get("success"):
+            continue
+        meta = entry.get("meta") or {}
+        usage = meta.get("usage") or {}
+        _add_usage_totals(ingest_token_totals, usage)
+        memory_usage = meta.get("memory_token_usage")
+        if memory_usage:
+            provider = memory_usage.get("provider", "unknown")
+            if memory_token_totals is None:
+                memory_token_totals = _empty_memory_token_totals(provider)
+            _add_memory_token_usage(memory_token_totals, memory_usage)
+    if memory_token_totals is None:
+        memory_token_totals = _empty_memory_token_totals("none")
+    return ingest_token_totals, memory_token_totals
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +771,17 @@ def load_executed_records(csv_path: str) -> set:
     return executed
 
 
+def ensure_csv_exists(csv_path: str) -> None:
+    if os.path.exists(csv_path):
+        return
+    try:
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+    except (csv.Error, IOError) as e:
+        print(f"Warning: Error initializing CSV: {e}", file=sys.stderr)
+
+
 def save_record_to_csv(csv_path: str, record: dict) -> None:
     file_exists = os.path.exists(csv_path)
     flat = record.copy()
@@ -744,21 +806,34 @@ def save_record_to_csv(csv_path: str, record: dict) -> None:
         print(f"Warning: Error writing CSV: {e}", file=sys.stderr)
 
 
+def make_qa_failure_key(sample_id: str, qi: int) -> str:
+    return f"{sample_id}:{qi}"
+
+
 # ---------------------------------------------------------------------------
 # Ingest
 # ---------------------------------------------------------------------------
 
-def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
+def run_ingest(
+    cfg: Config,
+    output_dir: str,
+    *,
+    retry_failures_only: bool = False,
+) -> tuple[list[dict], dict, dict]:
     """Load conversations into OpenClaw. Returns (result entries, memory_token_totals, ingest_token_totals)."""
     record_path = os.path.join(output_dir, ".ingest_record.json")
+    failure_path = os.path.join(output_dir, ".ingest_failures.json")
     ingest_record = load_ingest_record(record_path)
+    failure_record = load_failure_record(failure_path)
 
     samples = load_locomo_data(cfg.data_file, cfg.samples)
     results = []
     skipped = 0
+    failed = 0
     policy = cfg.session.policy
     memory_token_totals = _empty_memory_token_totals(cfg.memory_mode)
     ingest_token_totals = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
+    allowed_failure_keys = set(failure_record.keys()) if retry_failures_only else None
 
     for item in samples:
         sample_id = item["sample_id"]
@@ -781,8 +856,12 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
             if policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem":
                 oc_session_key = build_ingest_session_key(sample_id, meta["session_key"])
 
+            record_key = f"{cfg.agent_id}:{user_key}:{sample_id}:{meta['session_key']}"
+
+            if retry_failures_only and record_key not in (allowed_failure_keys or set()):
+                continue
+
             if is_already_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record):
-                record_key = f"{cfg.agent_id}:{user_key}:{sample_id}:{meta['session_key']}"
                 old_usage = ingest_record.get(record_key, {}).get("meta", {}).get("usage", {})
                 _add_usage_totals(ingest_token_totals, old_usage)
                 print(f"  [{label}] [SKIP] already ingested", file=sys.stderr)
@@ -888,11 +967,28 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
                 results.append(result_entry)
 
                 mark_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record, {
-                    "date_time": meta["date_time"], "usage": usage,
+                    "date_time": meta["date_time"], "usage": usage, "memory_token_usage": memory_token_usage or {},
                 })
+                clear_failure(failure_record, record_key)
+                save_ingest_record(ingest_record, record_path)
+                save_failure_record(failure_record, failure_path)
             except Exception as e:
-                print(f"    -> [FATAL] Ingest failed, aborting: {e}", file=sys.stderr)
-                raise RuntimeError(f"Ingest failed for sample {sample_id} session {meta['session_key']}: {e}") from e
+                print(f"    -> [SKIP-FAILED] Ingest failed, continuing: {e}", file=sys.stderr)
+                failed += 1
+                record_failure(
+                    failure_record,
+                    record_key,
+                    phase="ingest",
+                    meta={
+                        "sample_id": sample_id,
+                        "session_key": meta["session_key"],
+                        "date_time": meta["date_time"],
+                        "error": str(e),
+                        "session_run_key": oc_session_key or "",
+                    },
+                )
+                save_failure_record(failure_record, failure_path)
+                continue
 
             # Archive session (isolated policy) or keep alive (shared).
             # For ogmem, oc_session_key is always set above to keep each ingest
@@ -908,8 +1004,15 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
                 if sid:
                     reset_session(sid, cfg.agent_id, cfg.gateway.state_dir)
 
+    ingest_token_totals, aggregated_memory = aggregate_ingest_records(ingest_record)
+    if aggregated_memory.get("provider") != "none":
+        memory_token_totals = aggregated_memory
     save_ingest_record(ingest_record, record_path)
-    print(f"\n=== Ingest summary: {len(results)} completed, {skipped} skipped ===", file=sys.stderr)
+    save_failure_record(failure_record, failure_path)
+    print(
+        f"\n=== Ingest summary: {len(results)} completed this run, {skipped} skipped existing, {failed} failed ===",
+        file=sys.stderr,
+    )
     print(
         f"  Ingest tokens: in={ingest_token_totals['input_tokens']:,} "
         f"out={ingest_token_totals['output_tokens']:,} "
@@ -918,6 +1021,8 @@ def run_ingest(cfg: Config, output_dir: str) -> tuple[list[dict], dict, dict]:
         f"total={ingest_token_totals['total_tokens']:,}",
         file=sys.stderr,
     )
+    if failure_record:
+        print(f"  Ingest failures pending: {len(failure_record)} ({failure_path})", file=sys.stderr)
 
     if memory_token_totals["llm_total"] or memory_token_totals["embedding"]:
         label = "OV" if memory_token_totals.get("provider") == "openviking" else "oGMemory"
@@ -995,7 +1100,7 @@ def _process_single_question(
         else:
             usage = api_usage
     except Exception as e:
-        print(f"  [{sample_idx}]   [FATAL] QA failed: {e}", file=sys.stderr)
+        print(f"  [{sample_idx}]   [FAILED] QA request failed, deferring to failure handling: {e}", file=sys.stderr)
         raise
 
     record = {
@@ -1010,7 +1115,28 @@ def _process_single_question(
     return record
 
 
-def run_qa(cfg: Config, output_dir: str) -> dict:
+def aggregate_qa_results(csv_path: str) -> dict:
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
+    if not os.path.exists(csv_path):
+        return total_usage
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                usage = {
+                    "input_tokens": row.get("input_tokens", 0),
+                    "output_tokens": row.get("output_tokens", 0),
+                    "cacheRead": row.get("cacheRead", 0),
+                    "cacheWrite": row.get("cacheWrite", 0),
+                    "total_tokens": row.get("total_tokens", 0),
+                }
+                _add_usage_totals(total_usage, usage)
+    except (csv.Error, IOError):
+        pass
+    return total_usage
+
+
+def run_qa(cfg: Config, output_dir: str, *, retry_failures_only: bool = False) -> dict:
     """Run QA questions. Returns total usage dict."""
     samples = load_locomo_data(cfg.data_file, cfg.samples)
 
@@ -1021,12 +1147,16 @@ def run_qa(cfg: Config, output_dir: str) -> dict:
         parallel = 1
 
     csv_path = os.path.join(output_dir, "qa_results.csv")
+    failure_path = os.path.join(output_dir, ".qa_failures.json")
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    ensure_csv_exists(csv_path)
     executed = load_executed_records(csv_path)
+    failure_record = load_failure_record(failure_path)
+    allowed_failure_keys = set(failure_record.keys()) if retry_failures_only else None
     print(f"    Loaded {len(executed)} already executed records", file=sys.stderr)
     print(f"    Running with {parallel} concurrent workers", file=sys.stderr)
 
-    total_usage = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
+    failed = 0
 
     for idx, item in enumerate(samples):
         sample_id = item["sample_id"]
@@ -1035,7 +1165,15 @@ def run_qa(cfg: Config, output_dir: str) -> dict:
         if cfg.count is not None:
             qas = qas[:cfg.count]
 
-        pending = [(qi, qa) for qi, qa in enumerate(qas, start=1) if (sample_id, qi) not in executed]
+        pending = []
+        for qi, qa in enumerate(qas, start=1):
+            failure_key = make_qa_failure_key(sample_id, qi)
+            if retry_failures_only:
+                if failure_key in (allowed_failure_keys or set()):
+                    pending.append((qi, qa))
+                continue
+            if (sample_id, qi) not in executed:
+                pending.append((qi, qa))
         if not pending:
             print(f"\n=== Sample {sample_id} [{idx+1}]: all QA done, skipping ===", file=sys.stderr)
             continue
@@ -1045,18 +1183,47 @@ def run_qa(cfg: Config, output_dir: str) -> dict:
             print(f"    Question time: {question_time}", file=sys.stderr)
 
         with ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = []
+            futures: dict = {}
             for qi, qa in pending:
                 f = executor.submit(
                     _process_single_question,
                     sample_id, idx + 1, qi, qa, cfg, csv_path, question_time,
                 )
-                futures.append(f)
+                futures[f] = (qi, qa)
             for f in as_completed(futures):
-                record = f.result()
-                u = record.get("usage", {})
-                for k in total_usage:
-                    total_usage[k] += u.get(k, 0)
+                qi, qa = futures[f]
+                failure_key = make_qa_failure_key(sample_id, qi)
+                try:
+                    _ = f.result()
+                    clear_failure(failure_record, failure_key)
+                    save_failure_record(failure_record, failure_path)
+                except Exception as e:
+                    failed += 1
+                    print(f"  [{idx+1}]   [SKIP-FAILED] QA failed, continuing: {e}", file=sys.stderr)
+                    record_failure(
+                        failure_record,
+                        failure_key,
+                        phase="qa",
+                        meta={
+                            "sample_id": sample_id,
+                            "sample_idx": idx + 1,
+                            "qi": qi,
+                            "question": qa.get("question", ""),
+                            "expected": str(qa.get("answer", "")),
+                            "category": qa.get("category", ""),
+                            "evidence": qa.get("evidence", []),
+                            "error": str(e),
+                        },
+                    )
+                    save_failure_record(failure_record, failure_path)
 
-    print(f"\n    Total tokens: in={total_usage['input_tokens']} out={total_usage['output_tokens']} total={total_usage['total_tokens']}", file=sys.stderr)
+    total_usage = aggregate_qa_results(csv_path)
+    print(
+        f"\n    Total tokens: in={total_usage['input_tokens']} out={total_usage['output_tokens']} total={total_usage['total_tokens']}",
+        file=sys.stderr,
+    )
+    if failure_record:
+        print(f"    QA failures pending: {len(failure_record)} ({failure_path})", file=sys.stderr)
+    if failed:
+        print(f"    QA failures this run: {failed}", file=sys.stderr)
     return total_usage

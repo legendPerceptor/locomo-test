@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import sys
 
@@ -108,6 +109,15 @@ def check_qa_results(output_dir: str) -> dict:
     empty_responses = sum(1 for r in rows if not r.get("response") or r["response"].startswith("[ERROR"))
     if empty_responses:
         issues["empty_or_error_responses"] = empty_responses
+    failure_path = os.path.join(output_dir, ".qa_failures.json")
+    if os.path.exists(failure_path):
+        try:
+            with open(failure_path, "r", encoding="utf-8") as f:
+                failures = json.load(f)
+            if failures:
+                issues["qa_failures_pending"] = len(failures)
+        except Exception as e:
+            issues["qa_failures_read_error"] = str(e)
 
     return issues
 

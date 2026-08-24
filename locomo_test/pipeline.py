@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import Config
 from .checks import check_health, check_qa_results, check_judge_results, report_issues
-from .eval import run_ingest, run_qa
+from .eval import aggregate_ingest_records, load_ingest_record, run_ingest, run_qa
 from .judge import run_judge
 from .stats import run_stats
 
@@ -70,6 +70,7 @@ def run_pipeline(
     only: list[str] | None = None,
     skip: list[str] | None = None,
     resume: bool = False,
+    retry_failures: bool = False,
 ):
     """Execute the pipeline with step control."""
     skip = set(skip or [])
@@ -121,10 +122,14 @@ def run_pipeline(
                 sys.exit(1)
 
         elif step == "ingest":
-            _, memory_token_totals, ingest_token_totals = run_ingest(cfg, output_dir)
+            _, memory_token_totals, ingest_token_totals = run_ingest(
+                cfg,
+                output_dir,
+                retry_failures_only=retry_failures,
+            )
 
         elif step == "qa":
-            run_qa(cfg, output_dir)
+            run_qa(cfg, output_dir, retry_failures_only=retry_failures)
             issues = check_qa_results(output_dir)
             report_issues("qa", issues)
 
@@ -134,6 +139,13 @@ def run_pipeline(
             report_issues("judge", issues)
 
         elif step == "stats":
+            if ingest_token_totals is None or memory_token_totals is None:
+                record_path = os.path.join(output_dir, ".ingest_record.json")
+                ingest_token_totals, aggregated_memory = aggregate_ingest_records(
+                    load_ingest_record(record_path)
+                )
+                if memory_token_totals is None and aggregated_memory.get("provider") != "none":
+                    memory_token_totals = aggregated_memory
             run_stats(
                 cfg,
                 output_dir,
