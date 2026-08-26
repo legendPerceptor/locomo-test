@@ -13,6 +13,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
 from threading import Lock
 
 import requests
@@ -814,6 +815,160 @@ def make_qa_failure_key(sample_id: str, qi: int) -> str:
 # Ingest
 # ---------------------------------------------------------------------------
 
+def _process_single_ingest_session(
+    item: dict,
+    sess: dict,
+    cfg: Config,
+    ingest_record: dict,
+    record_lock: threading.Lock,
+    failure_record: dict,
+    failure_path: str,
+    output_dir: str,
+) -> dict | None:
+    """Process a single ingest session. Returns result entry, or None if skipped/failed.
+
+    Shared mutable state (ingest_record, failure_record) is guarded by record_lock.
+    """
+    sample_id = item["sample_id"]
+    user_key = cfg.user
+    policy = cfg.session.policy
+    meta = sess["meta"]
+    msg = sess["message"]
+    session_key = meta["session_key"]
+    label = f"{session_key} ({meta['date_time']})"
+
+    oc_session_key = None
+    if policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem":
+        oc_session_key = build_ingest_session_key(sample_id, session_key)
+
+    record_key = f"{cfg.agent_id}:{user_key}:{sample_id}:{session_key}"
+    with record_lock:
+        if is_already_ingested(cfg.agent_id, user_key, sample_id, session_key, ingest_record):
+            print(f"  [{label}] [SKIP] already ingested", file=sys.stderr)
+            return None
+
+    preview = msg.replace("\n", " | ")[:80]
+    print(f"  [{label}] {preview}...", file=sys.stderr)
+    if oc_session_key:
+        print(f"    [session-key] {oc_session_key}", file=sys.stderr)
+
+    try:
+        ingest_msg = msg
+        ingest_instructions = None
+        if cfg.memory_mode == "ogmem":
+            ingest_instructions = (
+                "The following is a historical conversation provided only for "
+                "oGMemory ingestion. Do not call any tools. Do not read, create, "
+                "or modify workspace files. Do not update MEMORY.md or memory/*.md. "
+                "Do not perform bootstrap, git, or workspace setup. "
+                "Reply exactly INGEST_OK."
+            )
+        elif cfg.memory_mode == "memcore":
+            memory_prompt = (
+                "Extract key facts from the next group conversation and store them "
+                "in a SEPARATE memory file named memory/YYYY-MM-DD.md where YYYY-MM-DD "
+                "is the CONVERSATION date (from the message header, NOT today). "
+                "Use the write tool immediately. Do not append to existing files, "
+                "create a new file per conversation date.\n\n"
+            )
+            ingest_msg = memory_prompt + msg
+
+        ogmem_log_baseline = None
+        ogmem_tokens_before = None
+        if cfg.memory_mode == "ogmem":
+            ogmem_wait_since = time.time()
+            ogmem_log_baseline = count_ogmem_after_turn_extract_logs(
+                cfg.ogmem.docker_container,
+                cfg.ogmem.log_tail,
+            )
+            ogmem_tokens_before = query_ogmem_token_stats(cfg.ogmem.api_url)
+
+        reply, usage = send_message_with_retry(
+            cfg.gateway.base_url, cfg.gateway.token, user_key,
+            ingest_msg, 2, cfg.agent_id, oc_session_key,
+            instructions=ingest_instructions,
+        )
+        print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
+
+        memory_token_usage = None
+        ov_token_usage = None
+        if cfg.memory_mode == "openviking":
+            compact_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
+            compact_result = trigger_openclaw_compact(cfg.gateway.base_url, cfg.gateway.token, compact_key)
+            if compact_result and compact_result.get("compacted") and cfg.openviking.api_url:
+                task_id = compact_result.get("taskId")
+                if task_id:
+                    ov_token_usage = query_ov_task_token_usage(
+                        cfg.openviking.api_url,
+                        task_id,
+                        cfg.openviking.api_key,
+                    )
+                if not ov_token_usage:
+                    sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
+                    ov_token_usage = query_ov_latest_task(
+                        cfg.openviking.api_url,
+                        resource_id=sid,
+                        api_key=cfg.openviking.api_key,
+                    )
+                if ov_token_usage:
+                    print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
+                    memory_token_usage = {"provider": "openviking", **ov_token_usage}
+        elif cfg.memory_mode == "ogmem":
+            wait_for_ogmem_after_turn_extract(
+                container=cfg.ogmem.docker_container,
+                session_key=oc_session_key or session_key,
+                baseline_count=ogmem_log_baseline or 0,
+                timeout=cfg.ogmem.wait_timeout,
+                interval=cfg.ogmem.wait_interval,
+                log_tail=cfg.ogmem.log_tail,
+                since=ogmem_wait_since,
+            )
+            ogmem_tokens_after = query_ogmem_token_stats(cfg.ogmem.api_url)
+            memory_token_usage = _ogmem_token_delta(ogmem_tokens_before or {}, ogmem_tokens_after)
+            print(
+                f"    [ogmem-token] llm={memory_token_usage['llm_total']:,} "
+                f"cacheRead={memory_token_usage['llm_cache_read']:,} "
+                f"cacheWrite={memory_token_usage['llm_cache_write']:,} "
+                f"embed={memory_token_usage['embedding']:,}",
+                file=sys.stderr,
+            )
+
+        result_entry = {
+            "sample_id": sample_id, "session": session_key,
+            "user": user_key, "reply": reply, "usage": usage,
+        }
+        if ov_token_usage:
+            result_entry["ov_token_usage"] = ov_token_usage
+        if memory_token_usage:
+            result_entry["memory_token_usage"] = memory_token_usage
+
+        # Mark as ingested (thread-safe), clear prior failure, and save periodically
+        with record_lock:
+            mark_ingested(cfg.agent_id, user_key, sample_id, session_key, ingest_record, {
+                "date_time": meta["date_time"], "usage": usage, "memory_token_usage": memory_token_usage or {},
+            })
+            clear_failure(failure_record, record_key)
+            save_failure_record(failure_record, failure_path)
+            save_ingest_record(ingest_record, os.path.join(output_dir, ".ingest_record.json"))
+
+        # Archive session
+        if (policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem") and oc_session_key:
+            found = get_session_id_from_key(oc_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
+            if found:
+                sf, sdir = found
+                sf_path = resolve_openclaw_session_file(sf, sdir)
+                reset_session(sf_path, cfg.agent_id, cfg.gateway.state_dir)
+        elif policy == SessionPolicy.SHARED and cfg.memory_mode not in ("openviking", "ogmem"):
+            sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
+            if sid:
+                reset_session(sid, cfg.agent_id, cfg.gateway.state_dir)
+
+        return result_entry
+    except Exception as e:
+        print(f"    -> [FATAL] Ingest failed for {label}: {e}", file=sys.stderr)
+        raise
+
+
 def run_ingest(
     cfg: Config,
     output_dir: str,
@@ -835,174 +990,76 @@ def run_ingest(
     ingest_token_totals = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
     allowed_failure_keys = set(failure_record.keys()) if retry_failures_only else None
 
+    record_lock = threading.Lock()  # Thread-safe access to ingest_record
+    # Build flat list of all sessions with their sample context
+    all_sessions = []
     for item in samples:
         sample_id = item["sample_id"]
-        user_key = cfg.user
         sessions = build_session_messages(item, tail=cfg.session.tail)
-
         print(f"\n=== Sample {sample_id} ===", file=sys.stderr)
-        print(f"    user: {user_key}, agent: {cfg.agent_id}, policy: {policy.value}", file=sys.stderr)
+        print(f"    user: {cfg.user}, agent: {cfg.agent_id}, policy: {policy.value}", file=sys.stderr)
         print(f"    {len(sessions)} session(s) to ingest", file=sys.stderr)
-
         for sess in sessions:
-            meta = sess["meta"]
-            msg = sess["message"]
-            label = f"{meta['session_key']} ({meta['date_time']})"
-
-            # Session key logic based on policy. oGMemory ingest is always
-            # isolated so each LoCoMo session can be extracted and observed
-            # independently before the next session starts.
-            oc_session_key = None
-            if policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem":
-                oc_session_key = build_ingest_session_key(sample_id, meta["session_key"])
-
-            record_key = f"{cfg.agent_id}:{user_key}:{sample_id}:{meta['session_key']}"
-
+            record_key = f"{cfg.agent_id}:{cfg.user}:{sample_id}:{sess['meta']['session_key']}"
             if retry_failures_only and record_key not in (allowed_failure_keys or set()):
                 continue
+            # Handle already-ingested (skip) here for correct counters
+            with record_lock:
+                if is_already_ingested(cfg.agent_id, cfg.user, sample_id, sess["meta"]["session_key"], ingest_record):
+                    old_usage = ingest_record.get(record_key, {}).get("meta", {}).get("usage", {})
+                    _add_usage_totals(ingest_token_totals, old_usage)
+                    skipped += 1
+                    continue
+            all_sessions.append((item, sess))
 
-            if is_already_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record):
-                old_usage = ingest_record.get(record_key, {}).get("meta", {}).get("usage", {})
-                _add_usage_totals(ingest_token_totals, old_usage)
-                print(f"  [{label}] [SKIP] already ingested", file=sys.stderr)
-                skipped += 1
-                continue
+    total_sessions = len(all_sessions)
+    print(f"\n=== Total: {len(samples)} samples, {total_sessions} sessions to ingest ===", file=sys.stderr)
+    print(f"    Parallel workers: {cfg.parallel}", file=sys.stderr)
 
-            preview = msg.replace("\n", " | ")[:80]
-            print(f"  [{label}] {preview}...", file=sys.stderr)
-            if oc_session_key:
-                print(f"    [session-key] {oc_session_key}", file=sys.stderr)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=cfg.parallel) as executor:
+        futures = {}
+        for item, sess in all_sessions:
+            sample_id = item["sample_id"]
+            session_key = sess["meta"]["session_key"]
+            label = f"{sample_id}/{session_key}"
+            record_key = f"{cfg.agent_id}:{cfg.user}:{sample_id}:{session_key}"
+            future = executor.submit(
+                _process_single_ingest_session,
+                item, sess, cfg, ingest_record, record_lock,
+                failure_record, failure_path, output_dir,
+            )
+            futures[future] = (label, record_key, sess, sample_id)
 
+        print(f"    Submitted {len(futures)} tasks", file=sys.stderr)
+
+        for future in as_completed(futures):
+            label, record_key, sess, sample_id = futures[future]
             try:
-                ingest_msg = msg
-                ingest_instructions = None
-                if cfg.memory_mode == "ogmem":
-                    ingest_instructions = (
-                        "The following is a historical conversation provided only for "
-                        "oGMemory ingestion. Do not call any tools. Do not read, create, "
-                        "or modify workspace files. Do not update MEMORY.md or memory/*.md. "
-                        "Do not perform bootstrap, git, or workspace setup. "
-                        "Reply exactly INGEST_OK."
-                    )
-                elif cfg.memory_mode == "memcore":
-                    memory_prompt = (
-                        "Extract key facts from the next group conversation and store them "
-                        "in a SEPARATE memory file named memory/YYYY-MM-DD.md where YYYY-MM-DD "
-                        "is the CONVERSATION date (from the message header, NOT today). "
-                        "Use the write tool immediately. Do not append to existing files, "
-                        "create a new file per conversation date.\n\n"
-                    )
-                    ingest_msg = memory_prompt + msg
-
-                ogmem_log_baseline = None
-                ogmem_tokens_before = None
-                if cfg.memory_mode == "ogmem":
-                    ogmem_wait_since = time.time()
-                    ogmem_log_baseline = count_ogmem_after_turn_extract_logs(
-                        cfg.ogmem.docker_container,
-                        cfg.ogmem.log_tail,
-                    )
-                    ogmem_tokens_before = query_ogmem_token_stats(cfg.ogmem.api_url)
-
-                reply, usage = send_message_with_retry(
-                    cfg.gateway.base_url, cfg.gateway.token, user_key,
-                    ingest_msg, 2, cfg.agent_id, oc_session_key,
-                    instructions=ingest_instructions,
-                )
-                _add_usage_totals(ingest_token_totals, usage)
-                print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
-
-                memory_token_usage = None
-                ov_token_usage = None
-                if cfg.memory_mode == "openviking":
-                    compact_key = oc_session_key or f"agent:{cfg.agent_id}:openresponses-user:{user_key}"
-                    compact_result = trigger_openclaw_compact(cfg.gateway.base_url, cfg.gateway.token, compact_key)
-                    if compact_result and compact_result.get("compacted") and cfg.openviking.api_url:
-                        task_id = compact_result.get("taskId")
-                        if task_id:
-                            ov_token_usage = query_ov_task_token_usage(
-                                cfg.openviking.api_url,
-                                task_id,
-                                cfg.openviking.api_key,
-                            )
-                        if not ov_token_usage:
-                            sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
-                            ov_token_usage = query_ov_latest_task(
-                                cfg.openviking.api_url,
-                                resource_id=sid,
-                                api_key=cfg.openviking.api_key,
-                            )
-                        if ov_token_usage:
-                            print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
-                            memory_token_usage = {"provider": "openviking", **ov_token_usage}
-                elif cfg.memory_mode == "ogmem":
-                    wait_for_ogmem_after_turn_extract(
-                        container=cfg.ogmem.docker_container,
-                        session_key=oc_session_key or meta["session_key"],
-                        baseline_count=ogmem_log_baseline or 0,
-                        timeout=cfg.ogmem.wait_timeout,
-                        interval=cfg.ogmem.wait_interval,
-                        log_tail=cfg.ogmem.log_tail,
-                        since=ogmem_wait_since,
-                    )
-                    ogmem_tokens_after = query_ogmem_token_stats(cfg.ogmem.api_url)
-                    memory_token_usage = _ogmem_token_delta(ogmem_tokens_before or {}, ogmem_tokens_after)
-                    print(
-                        f"    [ogmem-token] llm={memory_token_usage['llm_total']:,} "
-                        f"cacheRead={memory_token_usage['llm_cache_read']:,} "
-                        f"cacheWrite={memory_token_usage['llm_cache_write']:,} "
-                        f"embed={memory_token_usage['embedding']:,}",
-                        file=sys.stderr,
-                    )
-
-                result_entry = {
-                    "sample_id": sample_id, "session": meta["session_key"],
-                    "user": user_key, "reply": reply, "usage": usage,
-                }
-                if ov_token_usage:
-                    result_entry["ov_token_usage"] = ov_token_usage
-                if memory_token_usage:
-                    result_entry["memory_token_usage"] = memory_token_usage
-                    _add_memory_token_usage(memory_token_totals, memory_token_usage)
-                results.append(result_entry)
-
-                mark_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record, {
-                    "date_time": meta["date_time"], "usage": usage, "memory_token_usage": memory_token_usage or {},
-                })
-                clear_failure(failure_record, record_key)
-                save_ingest_record(ingest_record, record_path)
-                save_failure_record(failure_record, failure_path)
+                result = future.result()
+                if result:
+                    results.append(result)
+                else:
+                    skipped += 1
+                completed += 1
+                print(f"  [progress] {completed}/{len(futures)} completed", file=sys.stderr)
             except Exception as e:
-                print(f"    -> [SKIP-FAILED] Ingest failed, continuing: {e}", file=sys.stderr)
+                print(f"  [{label}] [FATAL] {e}", file=sys.stderr)
                 failed += 1
-                record_failure(
-                    failure_record,
-                    record_key,
-                    phase="ingest",
-                    meta={
-                        "sample_id": sample_id,
-                        "session_key": meta["session_key"],
-                        "date_time": meta["date_time"],
-                        "error": str(e),
-                        "session_run_key": oc_session_key or "",
-                    },
-                )
-                save_failure_record(failure_record, failure_path)
-                continue
-
-            # Archive session (isolated policy) or keep alive (shared).
-            # For ogmem, oc_session_key is always set above to keep each ingest
-            # session isolated even when QA policy is shared.
-            if (policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem") and oc_session_key:
-                found = get_session_id_from_key(oc_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
-                if found:
-                    sf, sdir = found
-                    sf_path = resolve_openclaw_session_file(sf, sdir)
-                    reset_session(sf_path, cfg.agent_id, cfg.gateway.state_dir)
-            elif policy == SessionPolicy.SHARED and cfg.memory_mode not in ("openviking", "ogmem"):
-                sid = get_session_id(user_key, cfg.agent_id, cfg.gateway.state_dir)
-                if sid:
-                    reset_session(sid, cfg.agent_id, cfg.gateway.state_dir)
+                with record_lock:
+                    record_failure(
+                        failure_record,
+                        record_key,
+                        phase="ingest",
+                        meta={
+                            "sample_id": sample_id,
+                            "session_key": sess["meta"]["session_key"],
+                            "date_time": sess["meta"]["date_time"],
+                            "error": str(e),
+                        },
+                    )
+                    save_failure_record(failure_record, failure_path)
+                print(f"  [progress] {completed}/{len(futures)} completed", file=sys.stderr)
 
     ingest_token_totals, aggregated_memory = aggregate_ingest_records(ingest_record)
     if aggregated_memory.get("provider") != "none":
@@ -1140,7 +1197,7 @@ def run_qa(cfg: Config, output_dir: str, *, retry_failures_only: bool = False) -
     """Run QA questions. Returns total usage dict."""
     samples = load_locomo_data(cfg.data_file, cfg.samples)
 
-    parallel = max(1, min(10, cfg.parallel))
+    parallel = max(1, cfg.parallel)  # Use configured parallel workers (default 32)
     # Shared policy forces serial QA (concurrent writes to same session would race)
     if cfg.session.policy == SessionPolicy.SHARED and parallel > 1:
         print(f"    [wm] shared session forces parallel=1 (was {parallel})", file=sys.stderr)
