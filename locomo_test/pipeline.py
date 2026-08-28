@@ -10,7 +10,13 @@ from pathlib import Path
 
 from .config import Config
 from .checks import check_health, check_qa_results, check_judge_results, report_issues
-from .eval import aggregate_ingest_records, load_ingest_record, run_ingest, run_qa
+from .eval import (
+    aggregate_ingest_records,
+    load_ingest_record,
+    load_memory_token_totals,
+    run_ingest,
+    run_qa,
+)
 from .judge import run_judge
 from .stats import run_stats
 
@@ -140,6 +146,11 @@ def run_pipeline(
 
         elif step == "stats":
             if ingest_token_totals is None or memory_token_totals is None:
+                # Prefer the authoritative global-delta totals persisted at ingest
+                # time; fall back to per-session aggregation (which can over-count
+                # under parallel ingest).
+                if memory_token_totals is None:
+                    memory_token_totals = load_memory_token_totals(output_dir)
                 record_path = os.path.join(output_dir, ".ingest_record.json")
                 ingest_token_totals, aggregated_memory = aggregate_ingest_records(
                     load_ingest_record(record_path)

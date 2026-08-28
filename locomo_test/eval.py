@@ -218,6 +218,34 @@ def aggregate_ingest_records(record: dict) -> tuple[dict, dict]:
     return ingest_token_totals, memory_token_totals
 
 
+def _memory_totals_path(output_dir: str) -> str:
+    return os.path.join(output_dir, ".memory_token_totals.json")
+
+
+def save_memory_token_totals(output_dir: str, totals: dict | None) -> None:
+    """Persist the authoritative (global-delta) memory token totals.
+
+    Per-session ogmem token deltas overlap under parallel ingest and over-count
+    when summed, so we store the single run-wide global delta separately so the
+    stats step can report it even when it runs in a later invocation.
+    """
+    if not totals:
+        return
+    try:
+        with open(_memory_totals_path(output_dir), "w", encoding="utf-8") as f:
+            json.dump(totals, f, indent=2)
+    except OSError:
+        pass
+
+
+def load_memory_token_totals(output_dir: str) -> dict | None:
+    try:
+        with open(_memory_totals_path(output_dir), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # OpenClaw state dir helpers
 # ---------------------------------------------------------------------------
@@ -877,10 +905,12 @@ def _process_single_ingest_session(
         ogmem_tokens_before = None
         if cfg.memory_mode == "ogmem":
             ogmem_wait_since = time.time()
-            ogmem_log_baseline = count_ogmem_after_turn_extract_logs(
-                cfg.ogmem.docker_container,
-                cfg.ogmem.log_tail,
-            )
+            # Skip docker log monitoring if docker_container is not configured
+            if cfg.ogmem.docker_container:
+                ogmem_log_baseline = count_ogmem_after_turn_extract_logs(
+                    cfg.ogmem.docker_container,
+                    cfg.ogmem.log_tail,
+                )
             ogmem_tokens_before = query_ogmem_token_stats(cfg.ogmem.api_url)
 
         reply, usage = send_message_with_retry(
@@ -914,24 +944,27 @@ def _process_single_ingest_session(
                     print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
                     memory_token_usage = {"provider": "openviking", **ov_token_usage}
         elif cfg.memory_mode == "ogmem":
-            wait_for_ogmem_after_turn_extract(
-                container=cfg.ogmem.docker_container,
-                session_key=oc_session_key or session_key,
-                baseline_count=ogmem_log_baseline or 0,
-                timeout=cfg.ogmem.wait_timeout,
-                interval=cfg.ogmem.wait_interval,
-                log_tail=cfg.ogmem.log_tail,
-                since=ogmem_wait_since,
-            )
+            # Skip docker log monitoring if docker_container is not configured
+            if cfg.ogmem.docker_container:
+                wait_for_ogmem_after_turn_extract(
+                    container=cfg.ogmem.docker_container,
+                    session_key=oc_session_key or session_key,
+                    baseline_count=ogmem_log_baseline or 0,
+                    timeout=cfg.ogmem.wait_timeout,
+                    interval=cfg.ogmem.wait_interval,
+                    log_tail=cfg.ogmem.log_tail,
+                    since=ogmem_wait_since,
+                )
             ogmem_tokens_after = query_ogmem_token_stats(cfg.ogmem.api_url)
             memory_token_usage = _ogmem_token_delta(ogmem_tokens_before or {}, ogmem_tokens_after)
-            print(
-                f"    [ogmem-token] llm={memory_token_usage['llm_total']:,} "
-                f"cacheRead={memory_token_usage['llm_cache_read']:,} "
-                f"cacheWrite={memory_token_usage['llm_cache_write']:,} "
-                f"embed={memory_token_usage['embedding']:,}",
-                file=sys.stderr,
-            )
+            if memory_token_usage:
+                print(
+                    f"    [ogmem-token] llm={memory_token_usage.get('llm_total', 0):,} "
+                    f"cacheRead={memory_token_usage.get('llm_cache_read', 0):,} "
+                    f"cacheWrite={memory_token_usage.get('llm_cache_write', 0):,} "
+                    f"embed={memory_token_usage.get('embedding', 0):,}",
+                    file=sys.stderr,
+                )
 
         result_entry = {
             "sample_id": sample_id, "session": session_key,
@@ -1017,6 +1050,15 @@ def run_ingest(
     print(f"    Parallel workers: {cfg.parallel}", file=sys.stderr)
 
     completed = 0
+    # Global oGMemory token snapshot around the whole (parallel) ingest run.
+    # Per-session before/after deltas of ogmem's cumulative counter overlap
+    # under concurrency and over-count when summed (each session's window
+    # includes concurrent sessions' LLM/embedding work). Take one authoritative
+    # global delta instead and use it for the run totals.
+    ogmem_global_before = None
+    if cfg.memory_mode == "ogmem":
+        ogmem_global_before = query_ogmem_token_stats(cfg.ogmem.api_url)
+
     with ThreadPoolExecutor(max_workers=cfg.parallel) as executor:
         futures = {}
         for item, sess in all_sessions:
@@ -1062,7 +1104,15 @@ def run_ingest(
                 print(f"  [progress] {completed}/{len(futures)} completed", file=sys.stderr)
 
     ingest_token_totals, aggregated_memory = aggregate_ingest_records(ingest_record)
-    if aggregated_memory.get("provider") != "none":
+    if cfg.memory_mode == "ogmem" and ogmem_global_before:
+        ogmem_global_after = query_ogmem_token_stats(cfg.ogmem.api_url)
+        global_memory_delta = _ogmem_token_delta(ogmem_global_before, ogmem_global_after)
+        if global_memory_delta:
+            # Authoritative count for the whole run. Per-session deltas overlap
+            # under parallel ingest and would inflate when summed.
+            memory_token_totals = global_memory_delta
+            save_memory_token_totals(output_dir, memory_token_totals)
+    elif aggregated_memory.get("provider") != "none":
         memory_token_totals = aggregated_memory
     save_ingest_record(ingest_record, record_path)
     save_failure_record(failure_record, failure_path)
