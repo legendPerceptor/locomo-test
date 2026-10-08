@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import Config
 from .checks import check_health, check_qa_results, check_judge_results, report_issues
-from .eval import aggregate_ingest_records, load_ingest_record, run_ingest, run_qa
+from .eval import aggregate_ingest_records, load_ingest_record, run_ingest, run_qa, require_verified_ogmem_ingestion
 from .judge import run_judge
 from .stats import run_stats
 
@@ -94,73 +94,76 @@ def run_pipeline(
     # Tee stderr to log file
     log_path = os.path.join(output_dir, "pipeline.log")
     log_file = open(log_path, "a", encoding="utf-8")
-    sys.stderr = _TeeStream(sys.stderr, log_file)
+    original_stderr = sys.stderr
+    sys.stderr = _TeeStream(original_stderr, log_file)
 
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"  locomo-test-kit pipeline", file=sys.stderr)
-    print(f"  name:    {cfg.name}", file=sys.stderr)
-    print(f"  dataset: {cfg.data_file}", file=sys.stderr)
-    print(f"  policy:  {cfg.session.policy.value}", file=sys.stderr)
-    print(f"  output:  {output_dir}", file=sys.stderr)
-    print(f"  steps:   {', '.join(s for s, e in active if e)}", file=sys.stderr)
-    print(f"{'='*60}\n", file=sys.stderr)
+    try:
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"  locomo-test-kit pipeline", file=sys.stderr)
+        print(f"  name:    {cfg.name}", file=sys.stderr)
+        print(f"  dataset: {cfg.data_file}", file=sys.stderr)
+        print(f"  policy:  {cfg.session.policy.value}", file=sys.stderr)
+        print(f"  output:  {output_dir}", file=sys.stderr)
+        print(f"  steps:   {', '.join(s for s, e in active if e)}", file=sys.stderr)
+        print(f"{'='*60}\n", file=sys.stderr)
 
-    memory_token_totals: dict | None = None
-    ingest_token_totals: dict | None = None
+        memory_token_totals: dict | None = None
+        ingest_token_totals: dict | None = None
 
-    for step, enabled in active:
-        if not enabled:
-            continue
+        for step, enabled in active:
+            if not enabled:
+                continue
 
-        print(f"\n--- Step: {step} ---", file=sys.stderr)
-        t0 = time.time()
+            print(f"\n--- Step: {step} ---", file=sys.stderr)
+            t0 = time.time()
 
-        if step == "health_check":
-            ok = check_health(cfg)
-            if not ok:
-                print("Health check failed. Are services running?", file=sys.stderr)
-                sys.exit(1)
+            if step == "health_check":
+                ok = check_health(cfg)
+                if not ok:
+                    print("Health check failed. Are services running?", file=sys.stderr)
+                    sys.exit(1)
 
-        elif step == "ingest":
-            _, memory_token_totals, ingest_token_totals = run_ingest(
-                cfg,
-                output_dir,
-                retry_failures_only=retry_failures,
-            )
-
-        elif step == "qa":
-            run_qa(cfg, output_dir, retry_failures_only=retry_failures)
-            issues = check_qa_results(output_dir)
-            report_issues("qa", issues)
-
-        elif step == "judge":
-            run_judge(cfg, output_dir)
-            issues = check_judge_results(output_dir)
-            report_issues("judge", issues)
-
-        elif step == "stats":
-            if ingest_token_totals is None or memory_token_totals is None:
-                record_path = os.path.join(output_dir, ".ingest_record.json")
-                ingest_token_totals, aggregated_memory = aggregate_ingest_records(
-                    load_ingest_record(record_path)
+            elif step == "ingest":
+                _, memory_token_totals, ingest_token_totals = run_ingest(
+                    cfg,
+                    output_dir,
+                    retry_failures_only=retry_failures,
                 )
-                if memory_token_totals is None and aggregated_memory.get("provider") != "none":
-                    memory_token_totals = aggregated_memory
-            run_stats(
-                cfg,
-                output_dir,
-                memory_token_totals=memory_token_totals,
-                ingest_token_totals=ingest_token_totals,
-            )
 
-        elapsed = time.time() - t0
-        print(f"  [{step}] done in {elapsed:.1f}s", file=sys.stderr)
+            elif step == "qa":
+                require_verified_ogmem_ingestion(cfg, output_dir)
+                run_qa(cfg, output_dir, retry_failures_only=retry_failures)
+                issues = check_qa_results(output_dir)
+                report_issues("qa", issues)
 
-    print(f"\n{'='*60}", file=sys.stderr)
-    print(f"  Pipeline complete. Output: {output_dir}", file=sys.stderr)
-    print(f"  Log: {log_path}", file=sys.stderr)
-    print(f"{'='*60}", file=sys.stderr)
+            elif step == "judge":
+                run_judge(cfg, output_dir)
+                issues = check_judge_results(output_dir)
+                report_issues("judge", issues)
 
-    # Restore stderr
-    sys.stderr = sys.stderr._original if isinstance(sys.stderr, _TeeStream) else sys.stderr
-    log_file.close()
+            elif step == "stats":
+                if ingest_token_totals is None or memory_token_totals is None:
+                    record_path = os.path.join(output_dir, ".ingest_record.json")
+                    ingest_token_totals, aggregated_memory = aggregate_ingest_records(
+                        load_ingest_record(record_path)
+                    )
+                    if memory_token_totals is None and aggregated_memory.get("provider") != "none":
+                        memory_token_totals = aggregated_memory
+                run_stats(
+                    cfg,
+                    output_dir,
+                    memory_token_totals=memory_token_totals,
+                    ingest_token_totals=ingest_token_totals,
+                )
+
+            elapsed = time.time() - t0
+            print(f"  [{step}] done in {elapsed:.1f}s", file=sys.stderr)
+
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"  Pipeline complete. Output: {output_dir}", file=sys.stderr)
+        print(f"  Log: {log_path}", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
+
+    finally:
+        sys.stderr = original_stderr
+        log_file.close()

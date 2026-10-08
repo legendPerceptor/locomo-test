@@ -50,10 +50,18 @@ class OgmemEnv:
     wait_timeout: int = 900
     wait_interval: float = 2.0
     log_tail: int = 500
+    chunk_chars: int = 2400
+    account_id: str = ""
+    user_id: str = ""
+    api_key: str = ""
 
     def __post_init__(self):
         if not self.api_url:
             self.api_url = f"http://localhost:{self.port}"
+        if self.chunk_chars < 512:
+            raise ValueError("ogmem.chunk_chars must be at least 512")
+        if self.wait_timeout <= 0:
+            raise ValueError("ogmem.wait_timeout must be positive")
 
 
 @dataclass
@@ -208,6 +216,10 @@ def load_config(test_toml_path: str) -> Config:
         wait_timeout=og.get("wait_timeout", 900),
         wait_interval=og.get("wait_interval", 2.0),
         log_tail=og.get("log_tail", 500),
+        chunk_chars=og.get("chunk_chars", 2400),
+        account_id=og.get("account_id", ""),
+        user_id=og.get("user_id", ""),
+        api_key=og.get("api_key") or os.environ.get("OGMEM_API_KEY", ""),
     )
 
     # --- judge ---

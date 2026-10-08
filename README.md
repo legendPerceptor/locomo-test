@@ -387,3 +387,87 @@ OPENCLAW_DIR=/path/to/openclaw AGFS_DATA_DIR=/path/to/agfs uv run python app.py 
 ├── models/             # 模型缓存（git 忽略）
 └── output/             # 测试输出
 ```
+
+## oGMemory: verified ingestion and bounded extraction
+
+The oGMemory runner now writes directly to `/api/v1/after_turn` with `wait=true`,
+`forceExtract=true`, and a unique `clientRequestId`. QA still uses OpenClaw.
+`INGEST_OK` and unrelated Docker log messages are **not** completion signals.
+A session is successful only after **every chunk** has a matching request response,
+a completed archive, no failed writes, and a verified empty indexing queue with
+zero failed events. The backend must include the `outbox.failed` count; older
+backends fail the preflight before model calls are made.
+
+Conversations are split at dialogue boundaries with a default 2,400-character
+ceiling (including repeated conversation-date and participant headers). Oversized
+individual turns are split without dropping text and retain the speaker label.
+This limits extraction output demand without blindly increasing `max_tokens`.
+It is not a token-limit guarantee; chunking can lose cross-chunk context and must
+be evaluated for both ingestion reliability and QA accuracy.
+
+### Fresh runs and identity
+
+Do **not** reuse the September 29 result directory or trust its old completion
+records. Copy the test configuration, choose a new `[general].name` and `user`,
+and explicitly configure the backend identity:
+
+```toml
+[ogmem]
+api_url = "http://127.0.0.1:4831"
+account_id = "YOUR-FRESH-ACCOUNT"
+user_id = "locomo"
+chunk_chars = 2400
+wait_timeout = 900
+```
+
+The account/user/agent must match the **OpenClaw oGMemory plugin's QA identity**.
+`general.user` is a gateway/run identity, not a substitute for `ogmem.account_id`
+or `ogmem.user_id`. Use a fresh OpenClaw QA scope as well; changing only the
+runner's name does not clear backend memories or gateway history. Empty backend
+identity options use server defaults, which might differ from the plugin.
+
+Run ingestion first, then QA after all sessions are verified:
+
+```bash
+.venv/bin/python -m locomo_test.cli run configs/YOUR-FRESH-CONFIG.toml --only ingest
+.venv/bin/python -m locomo_test.cli run configs/YOUR-FRESH-CONFIG.toml --only qa
+```
+
+QA (including `--resume` and `--only qa`) rejects missing, legacy, or
+input/config-mismatched ingestion records. The index barrier is account-wide:
+existing failed outbox events in the account also block success.
+
+### Resume safety
+
+Per-chunk checkpoints live under the run's `.ogmem_chunks/` directory. Completed
+chunks are skipped; archived chunks with incomplete indexing retry only the
+indexing check. A timeout, lost response, failed write, or interrupted in-flight
+request is **not automatically re-submitted**, even with `--retry-failures`:
+it may already have partially written memories. Reconcile the recorded session
+and request IDs against backend archives, or start a fresh run **and fresh memory
+account**. Do not delete checkpoints to force replay into the same account.
+
+### Backend compatibility and deployment
+
+The runner requires the AntTrail completion-tracking backend patch, including
+`outbox.failed` in the idle response. An older backend may return `idle=true`
+with only pending/processing counts; this is deliberately rejected because it
+does not prove indexing succeeded. `reason=session_not_found` is normal for the
+preflight's synthetic session ID; the missing `failed` count is the incompatibility.
+
+Backend deployment is managed entirely in `/home/test_lyj/Development/AntTrail/deploy`,
+not in this runner repository. The deployment's `.env` selects the patched image
+with `OGMEM_IMAGE=ogmemory:yuanjian_anttrail-completion-20261008`.
+There is no runner-side Compose override. To rebuild/deploy the patched source:
+
+```bash
+cd /home/test_lyj/Development/AntTrail/deploy
+docker compose -p yuanjian_anttrail --profile with-db build ogmem
+docker compose -p yuanjian_anttrail --profile with-db up -d --no-deps --no-build --wait ogmem
+```
+
+These commands recreate only the memory backend. Keep the image selection in
+AntTrail's deployment configuration so later ordinary Compose commands do not
+silently revert to a backend without completion tracking.
+
+Runner regression tests: `.venv/bin/python -m unittest discover -s tests -v`.

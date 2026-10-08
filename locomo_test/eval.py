@@ -18,6 +18,7 @@ from threading import Lock
 import requests
 
 from .config import Config, SessionPolicy
+from .ogmem_ingest import PROTOCOL, bounded_chunks, fingerprint, ingest_chunks, wait_for_index
 
 # ---------------------------------------------------------------------------
 # LoCoMo JSON parsing
@@ -526,32 +527,8 @@ def query_ov_latest_task(ov_api_url: str, resource_id: str | None = None, api_ke
 
 
 # ---------------------------------------------------------------------------
-# oGMemory API / log helpers
+# oGMemory API helpers
 # ---------------------------------------------------------------------------
-
-OGMEM_EXTRACT_LOG_MARKERS = (
-    "after_turn background extract done",
-    "dispose background flush done",
-    "dispose flush skipped",
-)
-
-
-def _is_ogmem_extract_completion_log(line: str) -> bool:
-    if any(marker in line for marker in OGMEM_EXTRACT_LOG_MARKERS):
-        return True
-
-    # Some dispose no-op paths (for example no_pending_messages or
-    # no_user_messages) only emit the HTTP access log. Background flush dispatch
-    # returns a larger response and is followed by an explicit completion log.
-    dispose_marker = 'POST /api/v1/dispose HTTP/1.1" 200 '
-    if dispose_marker not in line:
-        return False
-    match = re.search(r'POST /api/v1/dispose HTTP/1\.1" 200 (\d+)', line)
-    if not match:
-        return False
-    response_bytes = int(match.group(1))
-    return response_bytes < 80
-
 
 def query_ogmem_token_stats(ogmem_api_url: str) -> dict:
     """Read cumulative oGMemory token stats."""
@@ -623,65 +600,6 @@ def _add_memory_token_usage(total: dict, delta: dict | None) -> None:
         "embedding_calls",
     ):
         total[key] = int(total.get(key, 0) or 0) + int(delta.get(key, 0) or 0)
-
-
-def count_ogmem_after_turn_extract_logs(
-    container: str = "ogmem",
-    log_tail: int = 500,
-    since: float | None = None,
-) -> int:
-    """Count oGMemory background extraction completion log lines."""
-    cmd = ["docker", "logs", "--tail", str(log_tail)]
-    if since is not None:
-        # Keep sub-second precision. Truncating to an integer Unix timestamp can
-        # include the previous session's completion marker when the next ingest
-        # starts within the same second, making the runner continue before the
-        # current session's extraction has actually finished.
-        since_arg = datetime.fromtimestamp(
-            max(0.0, since), tz=timezone.utc,
-        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
-        cmd.extend(["--since", since_arg])
-    cmd.append(container)
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stdout.strip() or f"docker logs failed for {container}")
-    return sum(
-        1
-        for line in proc.stdout.splitlines()
-        if _is_ogmem_extract_completion_log(line)
-    )
-
-
-def wait_for_ogmem_after_turn_extract(
-    *,
-    container: str,
-    session_key: str,
-    baseline_count: int,
-    timeout: int,
-    interval: float,
-    log_tail: int = 500,
-    since: float | None = None,
-) -> dict:
-    """Wait until oGMemory logs one more background extraction completion."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        current_count = count_ogmem_after_turn_extract_logs(container, log_tail, since=since)
-        if current_count > (0 if since is not None else baseline_count):
-            print(f"    [ogmem] memory extraction/flush done ({session_key})", file=sys.stderr)
-            return {"completed": True, "baseline_count": baseline_count, "current_count": current_count}
-        time.sleep(interval)
-    grep_pattern = "|".join(OGMEM_EXTRACT_LOG_MARKERS)
-    raise RuntimeError(
-        f"Timed out waiting for oGMemory extract completion for {session_key}. "
-        f"Check: docker logs --tail {log_tail} {container} 2>&1 | grep -E '{grep_pattern}'"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -814,13 +732,42 @@ def make_qa_failure_key(sample_id: str, qi: int) -> str:
 # Ingest
 # ---------------------------------------------------------------------------
 
+def build_ogmem_chunks(cfg: Config, item: dict, meta: dict) -> list[str]:
+    header = (f"[group chat conversation: {meta['date_time']}]\n"
+              f"[participants: {meta['speakers']}]")
+    return bounded_chunks(
+        [format_locomo_message(turn) for turn in item["conversation"][meta["session_key"]]],
+        header, cfg.ogmem.chunk_chars,
+    )
+
+
+def require_verified_ogmem_ingestion(cfg: Config, output_dir: str) -> None:
+    """Also guards --resume/--only qa; old log-based success is not sufficient."""
+    if cfg.memory_mode != "ogmem":
+        return
+    records = load_ingest_record(os.path.join(output_dir, ".ingest_record.json"))
+    missing = []
+    for item in load_locomo_data(cfg.data_file, cfg.samples):
+        for session in build_session_messages(item, tail=cfg.session.tail):
+            meta = session["meta"]
+            key = f"{cfg.agent_id}:{cfg.user}:{item['sample_id']}:{meta['session_key']}"
+            record = records.get(key, {})
+            completion = record.get("meta", {}).get("completion") or {}
+            expected = fingerprint(cfg, build_ogmem_chunks(cfg, item, meta))
+            if (record.get("success") is not True or completion.get("protocol") != PROTOCOL
+                    or completion.get("fingerprint") != expected):
+                missing.append(key)
+    if missing:
+        raise RuntimeError(f"QA blocked: {len(missing)} session(s) lack verified ingestion; first: {missing[0]}")
+
+
 def run_ingest(
     cfg: Config,
     output_dir: str,
     *,
     retry_failures_only: bool = False,
 ) -> tuple[list[dict], dict, dict]:
-    """Load conversations into OpenClaw. Returns (result entries, memory_token_totals, ingest_token_totals)."""
+    """Load conversations into the configured memory provider. Returns (result entries, memory_token_totals, ingest_token_totals)."""
     record_path = os.path.join(output_dir, ".ingest_record.json")
     failure_path = os.path.join(output_dir, ".ingest_failures.json")
     ingest_record = load_ingest_record(record_path)
@@ -834,6 +781,14 @@ def run_ingest(
     memory_token_totals = _empty_memory_token_totals(cfg.memory_mode)
     ingest_token_totals = {"input_tokens": 0, "output_tokens": 0, "cacheRead": 0, "cacheWrite": 0, "total_tokens": 0}
     allowed_failure_keys = set(failure_record.keys()) if retry_failures_only else None
+    if cfg.memory_mode == "ogmem":
+        scope = {"agentId": cfg.agent_id, "sessionId": "locomo-ingestion-preflight"}
+        if cfg.ogmem.account_id:
+            scope["accountId"] = cfg.ogmem.account_id
+        if cfg.ogmem.user_id:
+            scope["userId"] = cfg.ogmem.user_id
+        # Verify backend capability before spending tokens or sending any writes.
+        wait_for_index(cfg, scope)
 
     for item in samples:
         sample_id = item["sample_id"]
@@ -849,11 +804,10 @@ def run_ingest(
             msg = sess["message"]
             label = f"{meta['session_key']} ({meta['date_time']})"
 
-            # Session key logic based on policy. oGMemory ingest is always
-            # isolated so each LoCoMo session can be extracted and observed
-            # independently before the next session starts.
+            # Gateway session keys apply only to gateway-backed ingestion.
+            # Direct oGMemory ingestion uses deterministic per-chunk UUIDs.
             oc_session_key = None
-            if policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem":
+            if policy == SessionPolicy.ISOLATED and cfg.memory_mode != "ogmem":
                 oc_session_key = build_ingest_session_key(sample_id, meta["session_key"])
 
             record_key = f"{cfg.agent_id}:{user_key}:{sample_id}:{meta['session_key']}"
@@ -862,6 +816,11 @@ def run_ingest(
                 continue
 
             if is_already_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record):
+                if cfg.memory_mode == "ogmem":
+                    expected = fingerprint(cfg, build_ogmem_chunks(cfg, item, meta))
+                    stored = ingest_record[record_key].get("meta", {}).get("completion") or {}
+                    if stored.get("protocol") != PROTOCOL or stored.get("fingerprint") != expected:
+                        raise RuntimeError("Unverified/changed legacy ingestion record; use a fresh run and memory namespace")
                 old_usage = ingest_record.get(record_key, {}).get("meta", {}).get("usage", {})
                 _add_usage_totals(ingest_token_totals, old_usage)
                 print(f"  [{label}] [SKIP] already ingested", file=sys.stderr)
@@ -876,15 +835,7 @@ def run_ingest(
             try:
                 ingest_msg = msg
                 ingest_instructions = None
-                if cfg.memory_mode == "ogmem":
-                    ingest_instructions = (
-                        "The following is a historical conversation provided only for "
-                        "oGMemory ingestion. Do not call any tools. Do not read, create, "
-                        "or modify workspace files. Do not update MEMORY.md or memory/*.md. "
-                        "Do not perform bootstrap, git, or workspace setup. "
-                        "Reply exactly INGEST_OK."
-                    )
-                elif cfg.memory_mode == "memcore":
+                if cfg.memory_mode == "memcore":
                     memory_prompt = (
                         "Extract key facts from the next group conversation and store them "
                         "in a SEPARATE memory file named memory/YYYY-MM-DD.md where YYYY-MM-DD "
@@ -894,23 +845,25 @@ def run_ingest(
                     )
                     ingest_msg = memory_prompt + msg
 
-                ogmem_log_baseline = None
+                completion = None
                 ogmem_tokens_before = None
                 if cfg.memory_mode == "ogmem":
-                    ogmem_wait_since = time.time()
-                    ogmem_log_baseline = count_ogmem_after_turn_extract_logs(
-                        cfg.ogmem.docker_container,
-                        cfg.ogmem.log_tail,
-                    )
                     ogmem_tokens_before = query_ogmem_token_stats(cfg.ogmem.api_url)
-
-                reply, usage = send_message_with_retry(
-                    cfg.gateway.base_url, cfg.gateway.token, user_key,
-                    ingest_msg, 2, cfg.agent_id, oc_session_key,
-                    instructions=ingest_instructions,
-                )
+                    chunks = build_ogmem_chunks(cfg, item, meta)
+                    conversation_time = parse_locomo_datetime(meta["date_time"])
+                    completion = ingest_chunks(
+                        cfg, output_dir, record_key, chunks,
+                        created_at=conversation_time.isoformat() if conversation_time else None,
+                    )
+                    reply, usage = "INGEST_VERIFIED", {}
+                else:
+                    reply, usage = send_message_with_retry(
+                        cfg.gateway.base_url, cfg.gateway.token, user_key,
+                        ingest_msg, 2, cfg.agent_id, oc_session_key,
+                        instructions=ingest_instructions,
+                    )
                 _add_usage_totals(ingest_token_totals, usage)
-                print(f"    -> {reply[:80]}{'...' if len(reply) > 80 else ''}", file=sys.stderr)
+                print(f"    -> {reply[:80]}", file=sys.stderr)
 
                 memory_token_usage = None
                 ov_token_usage = None
@@ -936,15 +889,6 @@ def run_ingest(
                             print(f"    [ov-task] llm={ov_token_usage['llm_total']:,} embed={ov_token_usage['embedding']:,} memories={ov_token_usage['memories']}", file=sys.stderr)
                             memory_token_usage = {"provider": "openviking", **ov_token_usage}
                 elif cfg.memory_mode == "ogmem":
-                    wait_for_ogmem_after_turn_extract(
-                        container=cfg.ogmem.docker_container,
-                        session_key=oc_session_key or meta["session_key"],
-                        baseline_count=ogmem_log_baseline or 0,
-                        timeout=cfg.ogmem.wait_timeout,
-                        interval=cfg.ogmem.wait_interval,
-                        log_tail=cfg.ogmem.log_tail,
-                        since=ogmem_wait_since,
-                    )
                     ogmem_tokens_after = query_ogmem_token_stats(cfg.ogmem.api_url)
                     memory_token_usage = _ogmem_token_delta(ogmem_tokens_before or {}, ogmem_tokens_after)
                     print(
@@ -968,6 +912,7 @@ def run_ingest(
 
                 mark_ingested(cfg.agent_id, user_key, sample_id, meta["session_key"], ingest_record, {
                     "date_time": meta["date_time"], "usage": usage, "memory_token_usage": memory_token_usage or {},
+                    "completion": completion,
                 })
                 clear_failure(failure_record, record_key)
                 save_ingest_record(ingest_record, record_path)
@@ -991,9 +936,8 @@ def run_ingest(
                 continue
 
             # Archive session (isolated policy) or keep alive (shared).
-            # For ogmem, oc_session_key is always set above to keep each ingest
-            # session isolated even when QA policy is shared.
-            if (policy == SessionPolicy.ISOLATED or cfg.memory_mode == "ogmem") and oc_session_key:
+            # oGMemory ingestion bypasses the gateway; do not clean up its sessions.
+            if cfg.memory_mode != "ogmem" and policy == SessionPolicy.ISOLATED and oc_session_key:
                 found = get_session_id_from_key(oc_session_key, user_key, cfg.agent_id, cfg.gateway.state_dir)
                 if found:
                     sf, sdir = found
